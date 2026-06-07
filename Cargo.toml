@@ -1,0 +1,22 @@
+[package]
+name = "tmux-select"
+version = "0.0.1"
+edition = "2024"
+authors = ["Ivan Zakharchanka <3axap4eHko@gmail.com>"]
+description = "Agent-aware tmux window picker with a built-in fuzzy finder for Claude Code and Codex"
+license = "Apache-2.0"
+repository = "https://github.com/3axap4eHko/tmux-select"
+homepage = "https://github.com/3axap4eHko/tmux-select"
+readme = "README.md"
+keywords = ["tmux", "fuzzy", "picker", "agent", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+termion = "4.0.6"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = true
+panic = "abort"

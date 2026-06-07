@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.96.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - run: rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal --component clippy
+      - run: cargo +${{ env.RUST_TOOLCHAIN }} clippy --locked --all-targets -- -D warnings
+      - run: cargo +${{ env.RUST_TOOLCHAIN }} test --locked
+
+  release:
+    name: Release (${{ matrix.artifact }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, artifact: tmux-select-linux-x64 }
+          - { runner: ubuntu-24.04-arm, artifact: tmux-select-linux-arm64 }
+          - { runner: macos-15-intel, artifact: tmux-select-darwin-x64 }
+          - { runner: macos-15, artifact: tmux-select-darwin-arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - run: rustup toolchain install ${{ env.RUST_TOOLCHAIN }} --profile minimal
+      - run: cargo +${{ env.RUST_TOOLCHAIN }} build --locked --release
+
+      - name: Package and upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          stage="$ARTIFACT"
+          mkdir -p "$stage"
+          cp target/release/tmux-select "$stage/tmux-select"
+          cp LICENSE README.md "$stage/"
+          tar -czf "$ARTIFACT.tar.gz" "$stage"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARTIFACT.tar.gz" > "$ARTIFACT.tar.gz.sha256"
+          else
+            shasum -a 256 "$ARTIFACT.tar.gz" > "$ARTIFACT.tar.gz.sha256"
+          fi
+          gh release create "$TAG" --title "$TAG" --generate-notes 2>/dev/null || true
+          gh release upload "$TAG" "$ARTIFACT.tar.gz" "$ARTIFACT.tar.gz.sha256" --clobber
