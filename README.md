@@ -6,11 +6,7 @@ window with the live state of any AI coding agents (Claude Code, Codex) running
 in its panes, so you can see at a glance which window needs your attention and
 jump straight to the pane that is blocked.
 
-```
-12: ~/projects/api [claude: blocked] [codex: working]
- 7: ~/notes
- 3: ~/projects/api [claude: idle]
-```
+https://github.com/user-attachments/assets/74f50ead-c774-462d-a619-862d38bb2888
 
 It lists the windows of the **current tmux session**, ordered by window index.
 Pick one and it switches to it; if a pane there is blocked, it focuses the
