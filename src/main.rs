@@ -112,18 +112,36 @@ fn pane_agent(pane: &Pane, agents: &HashMap<u32, AgentKind>) -> Option<AgentKind
         .or_else(|| AgentKind::from_name(&pane.current_command))
 }
 
+fn state_color(state: AgentState) -> picker::SpanColor {
+    match state {
+        AgentState::Idle => picker::SpanColor::Yellow,
+        AgentState::Working => picker::SpanColor::Green,
+        AgentState::Blocked => picker::SpanColor::Red,
+    }
+}
+
 fn candidate_for(window: &Window, readings: &[AgentReading]) -> picker::Candidate {
-    let mut groups = String::new();
+    let path = window.path.replace(['\t', '\n', '\r'], " ");
+    let mut display = format!("{:>2}: {}", window.window_index, path);
+    let mut length = display.chars().count();
+    let mut spans = Vec::with_capacity(readings.len());
     let mut blocked: Option<String> = None;
     for reading in readings {
-        groups.push_str(&format!(" [{}: {}]", reading.label, reading.state.label()));
+        let head = format!(" [{}: ", reading.label);
+        let state = reading.state.label();
+        display.push_str(&head);
+        display.push_str(state);
+        display.push(']');
+        let start = length + head.len();
+        spans.push((start..start + state.len(), state_color(reading.state)));
+        length = start + state.len() + 1;
         if reading.state == AgentState::Blocked && blocked.is_none() {
             blocked = Some(reading.pane_id.clone());
         }
     }
-    let path = window.path.replace(['\t', '\n', '\r'], " ");
     picker::Candidate {
-        display: format!("{:>2}: {}{}", window.window_index, path, groups),
+        display,
+        spans,
         window_id: window.window_id.clone(),
         pane_id: blocked,
     }
@@ -156,6 +174,7 @@ mod tests {
         assert_eq!(candidate.display, "12: ~/api");
         assert_eq!(candidate.window_id, "@3");
         assert_eq!(candidate.pane_id, None);
+        assert!(candidate.spans.is_empty());
     }
 
     #[test]
@@ -171,6 +190,27 @@ mod tests {
             "12: ~/api [claude: working] [codex: blocked] [claude: blocked]"
         );
         assert_eq!(candidate.pane_id.as_deref(), Some("%4"));
+        assert_eq!(
+            candidate.spans,
+            vec![
+                (19..26, picker::SpanColor::Green),
+                (36..43, picker::SpanColor::Red),
+                (54..61, picker::SpanColor::Red),
+            ]
+        );
+    }
+
+    #[test]
+    fn spans_use_char_indexes_for_a_non_ascii_path() {
+        let mut window = window();
+        window.path = "~/посткод".to_string();
+        let readings = [reading("%1", "claude", AgentState::Idle)];
+        let candidate = candidate_for(&window, &readings);
+        let chars: Vec<char> = candidate.display.chars().collect();
+        let (range, color) = &candidate.spans[0];
+        let word: String = chars[range.start..range.end].iter().collect();
+        assert_eq!(word, "idle");
+        assert_eq!(*color, picker::SpanColor::Yellow);
     }
 
     #[test]

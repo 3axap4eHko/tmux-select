@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::ops::Range;
 
 use termion::event::Key;
 use termion::input::TermRead;
@@ -8,8 +9,16 @@ use termion::{clear, color, cursor};
 
 use crate::tmux::Result;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpanColor {
+    Red,
+    Green,
+    Yellow,
+}
+
 pub struct Candidate {
     pub display: String,
+    pub spans: Vec<(Range<usize>, SpanColor)>,
     pub window_id: String,
     pub pane_id: Option<String>,
 }
@@ -150,8 +159,32 @@ fn render<W: Write>(
                     color::Fg(color::Cyan),
                     color::Fg(color::Reset)
                 )?;
-            } else {
-                write!(screen, "{ch}")?;
+                continue;
+            }
+            let span = candidates[index]
+                .spans
+                .iter()
+                .find_map(|(range, color)| range.contains(&char_index).then_some(*color));
+            match span {
+                Some(SpanColor::Red) => write!(
+                    screen,
+                    "{}{ch}{}",
+                    color::Fg(color::Red),
+                    color::Fg(color::Reset)
+                )?,
+                Some(SpanColor::Green) => write!(
+                    screen,
+                    "{}{ch}{}",
+                    color::Fg(color::Green),
+                    color::Fg(color::Reset)
+                )?,
+                Some(SpanColor::Yellow) => write!(
+                    screen,
+                    "{}{ch}{}",
+                    color::Fg(color::Yellow),
+                    color::Fg(color::Reset)
+                )?,
+                None => write!(screen, "{ch}")?,
             }
         }
 
@@ -295,6 +328,7 @@ mod tests {
     fn candidate(display: &str) -> Candidate {
         Candidate {
             display: display.to_string(),
+            spans: Vec::new(),
             window_id: "@0".into(),
             pane_id: None,
         }
