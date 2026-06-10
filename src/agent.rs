@@ -38,7 +38,7 @@ impl AgentState {
     }
 }
 
-const LIVE_LINES: usize = 20;
+const LIVE_LINES: usize = 8;
 
 pub fn match_state(kind: AgentKind, screen: &str) -> AgentState {
     let live = bottom_lines(screen, LIVE_LINES);
@@ -63,7 +63,7 @@ fn is_working(kind: AgentKind, line: &str) -> bool {
 
 fn is_blocked(kind: AgentKind, line: &str) -> bool {
     match kind {
-        AgentKind::Claude => line.contains("Enter to select"),
+        AgentKind::Claude => line.contains("Esc to cancel") && line.contains('·'),
         AgentKind::Codex => {
             line.contains("to submit answer")
                 || line.contains("to submit all")
@@ -140,6 +140,39 @@ mod tests {
     fn claude_selection_prompt_is_blocked() {
         let screen = "Do you want to make this edit to file.rs?\n  1. Yes\n  2. No\nEnter to select · ↑/↓ to navigate · Esc to cancel\n";
         assert_eq!(match_state(AgentKind::Claude, screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn claude_bash_approval_dialog_is_blocked() {
+        let screen = "\
+● Thinking for 13s, listing 2 directories… (ctrl+o to expand)
+  ⎿  $ ls /home/zenpie/projects/prmt/.github/workflows/ 2>/dev/null &&
+     echo \"===\" && wc -l /home/zenpie/projects/prmt/.github/workflows/*
+────────────────────────────────────────
+ Bash command
+
+   ls /home/zenpie/projects/prmt/.github/workflows/ 2>/dev/null
+   List workflows in prmt and gwt
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, allow reading from workflows/ from this project
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+";
+        assert_eq!(match_state(AgentKind::Claude, screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn claude_single_action_esc_hint_is_idle() {
+        assert_eq!(
+            match_state(
+                AgentKind::Claude,
+                &claude_frame("Edit and press Enter to retry, or Esc to cancel")
+            ),
+            AgentState::Idle
+        );
     }
 
     #[test]
