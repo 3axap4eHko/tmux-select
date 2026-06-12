@@ -19,6 +19,34 @@ impl AgentKind {
             AgentKind::Codex => "codex",
         }
     }
+
+    // The Claude installer symlinks ~/.local/bin/claude to a binary literally named
+    // by its version (e.g. .../share/claude/versions/2.1.173), and macOS records the
+    // resolved file's name as the process name, so the basename alone cannot identify
+    // the agent there.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn from_path(path: &str) -> Option<AgentKind> {
+        let mut components = path.split('/').rev();
+        let basename = components.next()?;
+        if let Some(kind) = AgentKind::from_name(basename) {
+            return Some(kind);
+        }
+        if !is_version_shaped(basename) {
+            return None;
+        }
+        components.find_map(AgentKind::from_name)
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_version_shaped(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    match (bytes.first(), bytes.last()) {
+        (Some(first), Some(last)) if first.is_ascii_digit() && last.is_ascii_digit() => {
+            bytes.iter().all(|b| b.is_ascii_digit() || *b == b'.')
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -97,6 +125,43 @@ mod tests {
         assert_eq!(AgentKind::from_name("codex"), Some(AgentKind::Codex));
         assert_eq!(AgentKind::from_name("npm"), None);
         assert_eq!(AgentKind::from_name("node"), None);
+    }
+
+    #[test]
+    fn from_path_matches_agent_basenames() {
+        assert_eq!(
+            AgentKind::from_path("/opt/homebrew/bin/codex"),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            AgentKind::from_path("/Users/me/.local/bin/claude"),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(AgentKind::from_path("claude"), Some(AgentKind::Claude));
+        assert_eq!(AgentKind::from_path("/usr/local/bin/node"), None);
+    }
+
+    #[test]
+    fn from_path_matches_a_version_named_binary_under_an_agent_directory() {
+        assert_eq!(
+            AgentKind::from_path("/Users/izakharchanka/.local/share/claude/versions/2.1.173"),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            AgentKind::from_path("/opt/codex/versions/9.9"),
+            Some(AgentKind::Codex)
+        );
+    }
+
+    #[test]
+    fn from_path_rejects_version_binaries_outside_agent_directories_and_vice_versa() {
+        assert_eq!(AgentKind::from_path("/opt/foo/versions/2.1.173"), None);
+        assert_eq!(
+            AgentKind::from_path("/Users/me/projects/claude/target/debug/mytool"),
+            None
+        );
+        assert_eq!(AgentKind::from_path("/opt/claude/versions/2.1.173b"), None);
+        assert_eq!(AgentKind::from_path(""), None);
     }
 
     #[test]

@@ -20,24 +20,6 @@ pub fn classify_panes(pane_pids: &HashSet<u32>) -> HashMap<u32, AgentKind> {
     owners
 }
 
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
-fn record(
-    pid: u32,
-    ppid: u32,
-    pgrp: u32,
-    tpgid: i64,
-    comm: &str,
-    parent: &mut Parent,
-    agents: &mut Agents,
-) {
-    parent.insert(pid, ppid);
-    if let Some(kind) = AgentKind::from_name(comm)
-        && i64::from(pgrp) == tpgid
-    {
-        agents.push((pid, kind));
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn collect_processes(parent: &mut Parent, agents: &mut Agents) {
     use std::fmt::Write as _;
@@ -67,32 +49,94 @@ fn collect_processes(parent: &mut Parent, agents: &mut Agents) {
             continue;
         }
         if let Some(stat) = parse_stat(&String::from_utf8_lossy(&buf)) {
-            record(
-                pid, stat.ppid, stat.pgrp, stat.tpgid, stat.comm, parent, agents,
-            );
+            parent.insert(pid, stat.ppid);
+            if let Some(kind) = AgentKind::from_name(stat.comm)
+                && i64::from(stat.pgrp) == stat.tpgid
+            {
+                agents.push((pid, kind));
+            }
+        }
+    }
+}
+
+// In-process libproc reads instead of spawning ps: every exec on a managed Mac is
+// taxed by endpoint-security agents (~100ms measured), and libc does not expose the
+// kinfo_proc sysctl table that ps wraps.
+#[cfg(target_os = "macos")]
+fn collect_processes(parent: &mut Parent, agents: &mut Agents) {
+    for pid in list_all_pids() {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written != size {
+            continue;
+        }
+        let info = unsafe { info.assume_init() };
+        let pid = pid as u32;
+        parent.insert(pid, info.pbi_ppid);
+        if info.pbi_pgid != info.e_tpgid {
+            continue;
+        }
+        if let Some(kind) = classify_foreground(pid, &info.pbi_comm) {
+            agents.push((pid, kind));
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn collect_processes(parent: &mut Parent, agents: &mut Agents) {
-    use std::process::Command;
+fn list_all_pids() -> Vec<libc::pid_t> {
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    // Processes can spawn between the count probe and the fetch; leave headroom.
+    let capacity = count as usize + 16;
+    let mut pids: Vec<libc::pid_t> = Vec::with_capacity(capacity);
+    let bytes = capacity * size_of::<libc::pid_t>();
+    let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes as libc::c_int) };
+    if filled <= 0 {
+        return Vec::new();
+    }
+    unsafe { pids.set_len((filled as usize).min(capacity)) };
+    pids.retain(|&pid| pid > 0);
+    pids
+}
 
-    let Ok(output) = Command::new("ps")
-        .args(["-axo", "pid=,ppid=,pgid=,tpgid=,ucomm="])
-        .output()
-    else {
-        return;
+#[cfg(target_os = "macos")]
+fn classify_foreground(pid: u32, comm: &[libc::c_char]) -> Option<AgentKind> {
+    let mut name = [0u8; 32];
+    for (dst, &src) in name.iter_mut().zip(comm) {
+        *dst = src as u8;
+    }
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    if let Some(kind) = std::str::from_utf8(&name[..end])
+        .ok()
+        .and_then(AgentKind::from_name)
+    {
+        return Some(kind);
+    }
+    // p_comm records the resolved executable's name, which for Claude is a bare
+    // version number; only the executable path can identify it.
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+        )
     };
-    if !output.status.success() {
-        return;
+    if len <= 0 {
+        return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        if let Some((pid, ppid, pgrp, tpgid, comm)) = parse_ps_line(line) {
-            record(pid, ppid, pgrp, tpgid, comm, parent, agents);
-        }
-    }
+    AgentKind::from_path(std::str::from_utf8(&buf[..len as usize]).ok()?)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -125,17 +169,6 @@ fn parse_stat(stat: &str) -> Option<Stat<'_>> {
         pgrp,
         tpgid,
     })
-}
-
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn parse_ps_line(line: &str) -> Option<(u32, u32, u32, i64, &str)> {
-    let mut fields = line.split_whitespace();
-    let pid = fields.next()?.parse().ok()?;
-    let ppid = fields.next()?.parse().ok()?;
-    let pgrp = fields.next()?.parse().ok()?;
-    let tpgid = fields.next()?.parse().ok()?;
-    let comm = fields.next()?;
-    Some((pid, ppid, pgrp, tpgid, comm))
 }
 
 fn climb_to_pane(start: u32, pane_pids: &HashSet<u32>, parent: &Parent) -> Option<u32> {
@@ -178,19 +211,6 @@ mod tests {
     fn parse_stat_keeps_processes_with_no_controlling_terminal() {
         let stat = parse_stat("3 (kthreadd) S 2 0 0 0 -1 0").unwrap();
         assert_eq!((stat.ppid, stat.pgrp, stat.tpgid), (2, 0, -1));
-    }
-
-    #[test]
-    fn parse_ps_line_reads_macos_columns() {
-        assert_eq!(
-            parse_ps_line("  501   499   501   501 codex"),
-            Some((501, 499, 501, 501, "codex"))
-        );
-        assert_eq!(
-            parse_ps_line("  502     1   502    -1 launchd"),
-            Some((502, 1, 502, -1, "launchd"))
-        );
-        assert_eq!(parse_ps_line("garbage"), None);
     }
 
     #[test]
