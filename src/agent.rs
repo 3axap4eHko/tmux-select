@@ -67,6 +67,7 @@ impl AgentState {
 }
 
 const LIVE_LINES: usize = 8;
+const CLAUDE_SPINNER: [char; 7] = ['·', '✢', '✳', '✶', '✻', '✽', '*'];
 
 pub fn match_state(kind: AgentKind, screen: &str) -> AgentState {
     let live = bottom_lines(screen, LIVE_LINES);
@@ -82,7 +83,10 @@ pub fn match_state(kind: AgentKind, screen: &str) -> AgentState {
 
 fn is_working(kind: AgentKind, line: &str) -> bool {
     match kind {
-        AgentKind::Claude => line.contains("ing… (") || line.trim_start().starts_with('◯'),
+        AgentKind::Claude => {
+            let head = line.trim_start();
+            (head.starts_with(CLAUDE_SPINNER) && head.contains("… (")) || head.starts_with('◯')
+        }
         AgentKind::Codex => {
             line.contains("to interrupt)") || line.contains("background terminal running")
         }
@@ -170,6 +174,21 @@ mod tests {
             "· Channeling… (1s · ↓ 21 tokens · thinking)",
             "✢ Forging… (2s · thinking with high effort)",
             "✻ Sublimating… (5s · ↓ 146 tokens · thought for 2s)",
+        ] {
+            assert_eq!(
+                match_state(AgentKind::Claude, &claude_frame(status)),
+                AgentState::Working,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_spinner_with_a_non_gerund_title_is_working() {
+        for status in [
+            "✻ Phase B: baby form from Quaternius pack… (12m 47s · ↓ 30.8k tokens)",
+            "✶ Yak-shaving… (3s · ↓ 1.2k tokens)",
+            "* Cooking dinner… (1s)",
         ] {
             assert_eq!(
                 match_state(AgentKind::Claude, &claude_frame(status)),
