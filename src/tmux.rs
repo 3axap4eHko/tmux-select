@@ -6,7 +6,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const SENTINEL: &str = "TMUXSELECT_SENTINEL";
-const PANE_FORMAT: &str = "#{pane_id}|#{window_id}|#{window_index}|#{pane_active}|#{pane_index}|#{pane_pid}|#{pane_current_command}|#{pane_current_path}";
+const PANE_FORMAT: &str = r"#{pane_id}|#{window_id}|#{window_index}|#{pane_active}|#{pane_index}|#{pane_pid}|#{pane_current_command}|#{s|\n| |:pane_current_path}";
 const PANE_FIELDS: usize = 8;
 
 pub struct Pane {
@@ -33,9 +33,13 @@ pub struct ControlClient {
 
 pub fn current_session_id() -> Result<String> {
     let tmux = env::var("TMUX").map_err(|_| "TMUX is not set; tmux-select must run inside tmux")?;
+    session_id_from_tmux_value(&tmux)
+}
+
+fn session_id_from_tmux_value(tmux: &str) -> Result<String> {
     let number = tmux
-        .split(',')
-        .nth(2)
+        .rsplit(',')
+        .next()
         .filter(|field| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit()))
         .ok_or("TMUX has an unexpected format; cannot resolve the current session id")?;
     Ok(format!("${number}"))
@@ -105,9 +109,7 @@ impl ControlClient {
     }
 
     pub fn enumerate(&mut self, session_id: &str) -> Result<Vec<Pane>> {
-        let body = self.command(&format!(
-            "list-panes -s -t '{session_id}' -F '{PANE_FORMAT}'"
-        ))?;
+        let body = self.command(&list_panes_command(session_id))?;
         body.lines().map(parse_pane).collect()
     }
 
@@ -175,6 +177,10 @@ fn command_number(rest: &str) -> Option<u64> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
+fn list_panes_command(session_id: &str) -> String {
+    format!("list-panes -s -t '{session_id}' -F \"{PANE_FORMAT}\"")
+}
+
 fn parse_pane(line: &str) -> Result<Pane> {
     let fields: Vec<&str> = line.splitn(PANE_FIELDS, '|').collect();
     if fields.len() != PANE_FIELDS {
@@ -218,6 +224,43 @@ mod tests {
             Block::End(text) => text,
             Block::Error(message) => panic!("expected %end block, got error: {message}"),
         }
+    }
+
+    #[test]
+    fn session_id_from_tmux_value_reads_the_final_field() {
+        assert_eq!(
+            session_id_from_tmux_value("/tmp/tmux-1000/default,12345,0").unwrap(),
+            "$0"
+        );
+    }
+
+    #[test]
+    fn session_id_from_tmux_value_allows_commas_in_the_socket_path() {
+        assert_eq!(
+            session_id_from_tmux_value("/tmp/agents/tmux-select,socket,67706,0").unwrap(),
+            "$0"
+        );
+    }
+
+    #[test]
+    fn session_id_from_tmux_value_rejects_a_non_numeric_final_field() {
+        assert!(session_id_from_tmux_value("/tmp/tmux-1000/default,12345,").is_err());
+        assert!(session_id_from_tmux_value("/tmp/tmux-1000/default,12345,current").is_err());
+    }
+
+    #[test]
+    fn list_panes_command_replaces_newlines_before_line_parsing() {
+        assert!(PANE_FORMAT.contains(r"#{s|\n| |:pane_current_path}"));
+        assert_eq!(
+            list_panes_command("$0"),
+            r##"list-panes -s -t '$0' -F "#{pane_id}|#{window_id}|#{window_index}|#{pane_active}|#{pane_index}|#{pane_pid}|#{pane_current_command}|#{s|\n| |:pane_current_path}""##
+        );
+    }
+
+    #[test]
+    fn parses_a_pane_line_after_newline_path_sanitization() {
+        let pane = parse_pane("%2|@0|12|1|3|2776867|npm|/tmp/a b").unwrap();
+        assert_eq!(pane.current_path, "/tmp/a b");
     }
 
     #[test]
