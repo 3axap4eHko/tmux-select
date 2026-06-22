@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::ops::Range;
 
@@ -212,45 +213,32 @@ fn render<W: Write>(
 }
 
 fn rank(candidates: &[Candidate], query: &str) -> Vec<usize> {
-    let mut scored: Vec<(usize, i32)> = candidates
+    let mut scored: Vec<(usize, f64, usize)> = candidates
         .iter()
         .enumerate()
         .filter_map(|(index, candidate)| {
-            fuzzy_score(query, &candidate.display).map(|(score, _)| (index, score))
+            fuzzy_score(query, &candidate.display).map(|(score, positions)| {
+                (index, score, positions.first().copied().unwrap_or(0))
+            })
         })
         .collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    scored.into_iter().map(|(index, _)| index).collect()
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.2.cmp(&b.2))
+            .then(a.0.cmp(&b.0))
+    });
+    scored.into_iter().map(|(index, _, _)| index).collect()
 }
 
-const SCORE_MIN: i32 = i32::MIN / 2;
-const MATCH_CONSECUTIVE: i32 = 1000;
-const BONUS_SLASH: i32 = 900;
-const BONUS_DELIMITER: i32 = 850;
-const BONUS_WORD: i32 = 800;
-const BONUS_CAPITAL: i32 = 700;
-const BONUS_DOT: i32 = 600;
-const GAP_INNER: i32 = -10;
-const GAP_EDGE: i32 = -5;
+const WORD_START: f64 = 1.0;
+const CONSECUTIVE: f64 = 2.0;
+const DECAY: f64 = 0.5;
+const GAP_PENALTY: f64 = 0.1;
 
-fn boundary_bonus(prev: char, cur: char) -> i32 {
-    if !cur.is_alphanumeric() {
-        return 0;
-    }
-    match prev {
-        '/' => BONUS_SLASH,
-        '-' | '_' | ' ' => BONUS_WORD,
-        ':' | ';' | '|' | ',' | '[' | ']' | '(' | ')' => BONUS_DELIMITER,
-        '.' => BONUS_DOT,
-        p if p.is_ascii_lowercase() && cur.is_ascii_uppercase() => BONUS_CAPITAL,
-        p if !p.is_ascii_digit() && cur.is_ascii_digit() => BONUS_CAPITAL,
-        _ => 0,
-    }
-}
-
-fn fuzzy_score(query: &str, text: &str) -> Option<(i32, Vec<usize>)> {
+fn fuzzy_score(query: &str, text: &str) -> Option<(f64, Vec<usize>)> {
     if query.is_empty() {
-        return Some((0, Vec::new()));
+        return Some((0.0, Vec::new()));
     }
     let needle: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
     let hay: Vec<char> = text.chars().collect();
@@ -259,54 +247,71 @@ fn fuzzy_score(query: &str, text: &str) -> Option<(i32, Vec<usize>)> {
         return None;
     }
 
-    let mut bonus = vec![0; w];
-    let mut prev = '/';
+    let mut word_start = vec![false; w];
+    let mut prev_alnum = false;
     for (j, &ch) in hay.iter().enumerate() {
-        bonus[j] = boundary_bonus(prev, ch);
-        prev = ch;
+        let alnum = ch.is_alphanumeric();
+        word_start[j] = alnum && !prev_alnum;
+        prev_alnum = alnum;
     }
 
-    let mut d = vec![SCORE_MIN; n * w];
-    let mut m = vec![SCORE_MIN; n * w];
+    let mut weight = vec![1.0; n];
+    for i in 1..n {
+        weight[i] = weight[i - 1] * DECAY;
+    }
+
+    let mut score = vec![f64::NEG_INFINITY; n * w];
+    let mut back = vec![usize::MAX; n * w];
     for i in 0..n {
-        let gap = if i == n - 1 { GAP_EDGE } else { GAP_INNER };
-        let mut running = SCORE_MIN;
         for j in 0..w {
-            if hay[j].to_ascii_lowercase() == needle[i] {
-                let score = if i == 0 {
-                    (j as i32) * GAP_EDGE + bonus[j]
-                } else if j > 0 {
-                    let diag = (i - 1) * w + (j - 1);
-                    (m[diag] + bonus[j]).max(d[diag] + MATCH_CONSECUTIVE)
-                } else {
-                    SCORE_MIN
-                };
-                d[i * w + j] = score;
-                running = score.max(running.saturating_add(gap));
-            } else {
-                running = running.saturating_add(gap);
+            if hay[j].to_ascii_lowercase() != needle[i] {
+                continue;
             }
-            m[i * w + j] = running;
+            if i == 0 {
+                score[j] = weight[0] * if word_start[j] { WORD_START } else { 0.0 };
+                continue;
+            }
+            let mut best = f64::NEG_INFINITY;
+            let mut from = usize::MAX;
+            for jp in 0..j {
+                let prev = score[(i - 1) * w + jp];
+                if prev == f64::NEG_INFINITY {
+                    continue;
+                }
+                let gap = (j - jp - 1) as f64;
+                let value = if jp + 1 == j {
+                    CONSECUTIVE
+                } else if word_start[j] {
+                    WORD_START
+                } else {
+                    0.0
+                };
+                let candidate = prev + weight[i] * value - GAP_PENALTY * gap;
+                if candidate > best {
+                    best = candidate;
+                    from = jp;
+                }
+            }
+            if from != usize::MAX {
+                score[i * w + j] = best;
+                back[i * w + j] = from;
+            }
         }
     }
 
-    let best = m[(n - 1) * w + (w - 1)];
-    let mut positions = vec![0usize; n];
-    let mut required = false;
-    let mut upper = w;
-    for i in (0..n).rev() {
-        let mut j = upper;
-        while j > 0 {
-            j -= 1;
-            let cell = i * w + j;
-            if d[cell] != SCORE_MIN && (required || d[cell] == m[cell]) {
-                required =
-                    i > 0 && j > 0 && m[cell] == d[(i - 1) * w + (j - 1)] + MATCH_CONSECUTIVE;
-                positions[i] = j;
-                upper = j;
-                break;
-            }
+    let mut best = f64::NEG_INFINITY;
+    let mut end = usize::MAX;
+    for j in 0..w {
+        if score[(n - 1) * w + j] > best {
+            best = score[(n - 1) * w + j];
+            end = j;
         }
+    }
+    let mut positions = vec![0usize; n];
+    let mut j = end;
+    for i in (0..n).rev() {
+        positions[i] = j;
+        j = back[i * w + j];
     }
     Some((best, positions))
 }
@@ -336,7 +341,7 @@ mod tests {
 
     #[test]
     fn empty_query_matches_everything() {
-        assert_eq!(fuzzy_score("", "anything"), Some((0, Vec::new())));
+        assert_eq!(fuzzy_score("", "anything"), Some((0.0, Vec::new())));
     }
 
     #[test]
@@ -373,7 +378,7 @@ mod tests {
         let (score, positions) = fuzzy_score("t", "23: ~/projects/tmux-select").unwrap();
         let hay: Vec<char> = "23: ~/projects/tmux-select".chars().collect();
         assert_eq!(hay[positions[0] - 1], '/');
-        assert!(score > BONUS_SLASH / 2);
+        assert_eq!(score, WORD_START);
     }
 
     #[test]
@@ -398,5 +403,50 @@ mod tests {
     fn rank_with_empty_query_keeps_all_in_order() {
         let candidates = [candidate("a"), candidate("b"), candidate("c")];
         assert_eq!(rank(&candidates, ""), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn whole_word_match_beats_split_match() {
+        let whole = fuzzy_score("abc", "~/.abc").unwrap().0;
+        let split = fuzzy_score("abc", "~/ab/c").unwrap().0;
+        assert!(whole > split);
+    }
+
+    #[test]
+    fn early_word_start_beats_buried_run() {
+        let early = fuzzy_score("abc", "~/ab/zc").unwrap().0;
+        let buried = fuzzy_score("abc", "~/zabc").unwrap().0;
+        assert!(early > buried);
+    }
+
+    #[test]
+    fn contiguous_match_beats_word_starts_flung_across_an_annotation() {
+        let contiguous = fuzzy_score("ai", "15: ~/projects/overlaid").unwrap().0;
+        let scattered = fuzzy_score("ai", "13: ~/projects/arpg [claude: idle]").unwrap().0;
+        assert!(contiguous > scattered);
+    }
+
+    #[test]
+    fn ranks_word_start_and_consecutiveness_with_positional_decay() {
+        let candidates = [
+            candidate("~/abc"),
+            candidate("~/.abc"),
+            candidate("~/a-b-c"),
+            candidate("~/a/b/c"),
+            candidate("~/ab/c"),
+            candidate("~/ab/zc"),
+            candidate("~/zabc"),
+            candidate("~/azbzc"),
+        ];
+        let ranked: Vec<&str> = rank(&candidates, "abc")
+            .iter()
+            .map(|&index| candidates[index].display.as_str())
+            .collect();
+        assert_eq!(
+            ranked,
+            vec![
+                "~/abc", "~/.abc", "~/ab/c", "~/ab/zc", "~/a-b-c", "~/a/b/c", "~/zabc", "~/azbzc",
+            ]
+        );
     }
 }
