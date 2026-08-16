@@ -2,6 +2,7 @@
 pub enum AgentKind {
     Claude,
     Codex,
+    Kimi,
 }
 
 impl AgentKind {
@@ -9,6 +10,7 @@ impl AgentKind {
         match name {
             "claude" => Some(AgentKind::Claude),
             "codex" => Some(AgentKind::Codex),
+            "kimi" => Some(AgentKind::Kimi),
             _ => None,
         }
     }
@@ -17,6 +19,7 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Kimi => "kimi",
         }
     }
 
@@ -68,6 +71,15 @@ impl AgentState {
 
 const LIVE_LINES: usize = 8;
 const CLAUDE_SPINNER: [char; 7] = ['·', '✢', '✳', '✶', '✻', '✽', '*'];
+const KIMI_MOON_SPINNER: [char; 8] = ['🌑', '🌒', '🌓', '🌔', '🌕', '🌖', '🌗', '🌘'];
+const KIMI_BRAILLE_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const KIMI_SWARM_ACTIVITY: [&str; 5] = [
+    "Orchestrating...",
+    "Prompting...",
+    "Working...",
+    "Queued...",
+    "Rate limited...",
+];
 
 pub fn match_state(kind: AgentKind, screen: &str) -> AgentState {
     let live = bottom_lines(screen, LIVE_LINES);
@@ -75,7 +87,9 @@ pub fn match_state(kind: AgentKind, screen: &str) -> AgentState {
     if live.iter().any(|&line| is_blocked(kind, line)) {
         return AgentState::Blocked;
     }
-    if live.iter().any(|&line| is_working(kind, line)) {
+    if live.iter().any(|&line| is_working(kind, line))
+        || (kind == AgentKind::Kimi && kimi_has_active_swarm(&live))
+    {
         return AgentState::Working;
     }
     AgentState::Idle
@@ -90,6 +104,60 @@ fn is_working(kind: AgentKind, line: &str) -> bool {
         AgentKind::Codex => {
             line.contains("to interrupt)") || line.contains("background terminal running")
         }
+        AgentKind::Kimi => kimi_is_working(line),
+    }
+}
+
+fn kimi_is_working(line: &str) -> bool {
+    let head = line.trim_start();
+    let mut chars = head.chars();
+    let Some(frame) = chars.next() else {
+        return false;
+    };
+    if KIMI_MOON_SPINNER.contains(&frame) {
+        return true;
+    }
+    if KIMI_BRAILLE_SPINNER.contains(&frame) {
+        let status = chars.as_str().trim_start();
+        if status.starts_with("thinking...")
+            || status.starts_with("working...")
+            || status.contains("Agent Starting")
+            || status.contains("Agent Queued")
+            || status.contains("Agent Running")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn kimi_has_active_swarm(lines: &[&str]) -> bool {
+    let has_header = lines
+        .iter()
+        .any(|line| line.trim_start().starts_with("─ Agent Swarm"));
+    has_header
+        && lines.iter().any(|line| {
+            let head = line.trim_start();
+            KIMI_SWARM_ACTIVITY
+                .iter()
+                .any(|status| kimi_is_swarm_activity_line(head, status))
+        })
+}
+
+fn kimi_is_swarm_activity_line(line: &str, status: &str) -> bool {
+    match status {
+        "Orchestrating..." => line == status,
+        "Prompting..." => line == status || line.starts_with("Prompting... "),
+        "Working..." | "Rate limited..." => {
+            line == status
+                || line
+                    .strip_prefix(status)
+                    .is_some_and(|tail| tail.starts_with("  ━"))
+        }
+        "Queued..." => line.split_once(' ').is_some_and(|(id, text)| {
+            id.len() == 3 && id.bytes().all(|byte| byte.is_ascii_digit()) && text == "Queued..."
+        }),
+        _ => false,
     }
 }
 
@@ -101,7 +169,19 @@ fn is_blocked(kind: AgentKind, line: &str) -> bool {
                 || line.contains("to submit all")
                 || (line.contains("to confirm or") && line.contains("to cancel"))
         }
+        AgentKind::Kimi => kimi_is_blocked(line),
     }
+}
+
+fn kimi_is_blocked(line: &str) -> bool {
+    let head = line.trim();
+    (head.starts_with("↑/↓ select · ") && head.contains(" choose · ↵ confirm"))
+        || head == "Type feedback · ↵ submit."
+        || (head.starts_with("↑↓ select")
+            && (head.contains("↵ choose")
+                || head.contains("↵ toggle")
+                || head.contains("↵ confirm")))
+        || (head.starts_with("type answer") && head.contains("↵ save"))
 }
 
 fn bottom_lines(screen: &str, n: usize) -> Vec<&str> {
@@ -127,6 +207,7 @@ mod tests {
     fn from_name_matches_only_known_agents() {
         assert_eq!(AgentKind::from_name("claude"), Some(AgentKind::Claude));
         assert_eq!(AgentKind::from_name("codex"), Some(AgentKind::Codex));
+        assert_eq!(AgentKind::from_name("kimi"), Some(AgentKind::Kimi));
         assert_eq!(AgentKind::from_name("npm"), None);
         assert_eq!(AgentKind::from_name("node"), None);
     }
@@ -142,6 +223,10 @@ mod tests {
             Some(AgentKind::Claude)
         );
         assert_eq!(AgentKind::from_path("claude"), Some(AgentKind::Claude));
+        assert_eq!(
+            AgentKind::from_path("/home/me/.kimi-code/bin/kimi"),
+            Some(AgentKind::Kimi)
+        );
         assert_eq!(AgentKind::from_path("/usr/local/bin/node"), None);
     }
 
@@ -312,6 +397,153 @@ mod tests {
     }
 
     #[test]
+    fn kimi_moon_spinner_is_working() {
+        for frame in KIMI_MOON_SPINNER {
+            let screen = format!("tool output\n  {frame} Running command\n> \n");
+            assert_eq!(
+                match_state(AgentKind::Kimi, &screen),
+                AgentState::Working,
+                "{frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_braille_activity_is_working() {
+        for frame in KIMI_BRAILLE_SPINNER {
+            for status in [
+                "thinking...",
+                "working...",
+                "Reviewer Agent Starting · 0 tools · 0s",
+                "Reviewer Agent Queued · 0 tools · 1s",
+                "Reviewer Agent Running · 2 tools · 3s",
+            ] {
+                let screen = format!("tool output\n  {frame} {status}\n> \n");
+                assert_eq!(
+                    match_state(AgentKind::Kimi, &screen),
+                    AgentState::Working,
+                    "{frame} {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_swarm_activity_is_working() {
+        for status in KIMI_SWARM_ACTIVITY {
+            let status_line = match status {
+                "Orchestrating..." => status.to_string(),
+                "Prompting..." => format!("{status} review each module"),
+                "Queued..." => format!("001 {status}"),
+                _ => format!("{status}  ━━━━━"),
+            };
+            let screen = format!("─ Agent Swarm ─ review\n\n{status_line}\n> \n");
+            assert_eq!(
+                match_state(AgentKind::Kimi, &screen),
+                AgentState::Working,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_approval_prompt_is_blocked() {
+        let screen = "\
+────────────────────────────────────────
+  ▶ Run this command?
+
+  $ cargo test
+
+  ▶ 1. Approve
+    2. Approve for this session
+    3. Reject
+
+  ↑/↓ select · 1/2/3 choose · ↵ confirm
+────────────────────────────────────────
+";
+        assert_eq!(match_state(AgentKind::Kimi, screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn kimi_approval_feedback_is_blocked() {
+        let screen = "\
+  ▶ 3. Reject
+
+  Type feedback · ↵ submit.
+────────────────────────────────────────
+";
+        assert_eq!(match_state(AgentKind::Kimi, screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn kimi_question_prompt_is_blocked() {
+        for footer in [
+            "  ↑↓ select  1-3 / ↵ choose  ←/→/tab switch  esc cancel",
+            "  ↑↓ select  1-3 / ↵ toggle  ←/→/tab switch  esc cancel",
+            "  ↑↓ select  1/2 choose  ↵ confirm  ←/→/tab switch  esc cancel",
+            "  type answer  ↵ save  tab switch  esc cancel",
+        ] {
+            let screen = format!(" question\n\n ? Which option?\n\n{footer}\n────────────\n");
+            assert_eq!(
+                match_state(AgentKind::Kimi, &screen),
+                AgentState::Blocked,
+                "{footer}"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_blocked_prompt_wins_over_spinner() {
+        let screen = "\
+🌗
+  ▶ Run this command?
+  ▶ 1. Approve
+    2. Reject
+  ↑/↓ select · 1/2 choose · ↵ confirm
+────────────────────────────────────────
+";
+        assert_eq!(match_state(AgentKind::Kimi, screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn kimi_ambiguous_spinner_symbols_are_idle() {
+        for line in [
+            "⠋ Downloading update",
+            "⣀⣄⣤⣦⣶⣷⣿",
+            "◐ backgrounded",
+            "◓",
+            "Working... final response",
+            "Queued...",
+            "Completed.  ━━━━━",
+        ] {
+            assert_eq!(
+                match_state(AgentKind::Kimi, &format!("{line}\n> \n")),
+                AgentState::Idle,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_completed_swarm_with_response_text_is_idle() {
+        let screen = "\
+─ Agent Swarm ─ review
+
+ Completed.  ━━━━━
+
+Working... final response
+>
+";
+        assert_eq!(match_state(AgentKind::Kimi, screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn kimi_plain_prompt_is_idle() {
+        let screen = "Welcome to Kimi Code\n\n> \n~/projects/tmux-select\n";
+        assert_eq!(match_state(AgentKind::Kimi, screen), AgentState::Idle);
+    }
+
+    #[test]
     fn frozen_transcript_is_idle() {
         let screen = "✻ Crunched for 6m 41s\n✻ Waiting for 1 dynamic workflow to finish\n● Dynamic workflow \"x\" completed · 11s\n✻ Churned for 43s\n  7 tasks (6 done, 1 open)\n  ◻ a\n  ✔ b\n  ✔ c\n  … +2 completed\n────────────\n❯ sequence the fixes, critical first\n────────────\n  ~/projects/arpg  claude  75%\n  ⏵⏵ auto mode on\n";
         assert_eq!(match_state(AgentKind::Claude, screen), AgentState::Idle);
@@ -337,5 +569,6 @@ mod tests {
     fn empty_screen_is_idle() {
         assert_eq!(match_state(AgentKind::Claude, ""), AgentState::Idle);
         assert_eq!(match_state(AgentKind::Codex, ""), AgentState::Idle);
+        assert_eq!(match_state(AgentKind::Kimi, ""), AgentState::Idle);
     }
 }

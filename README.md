@@ -2,9 +2,9 @@
 
 An agent-aware tmux window picker. It replaces the usual
 `list-windows | fzf | select-window` binding with a picker that annotates each
-window with the live state of any AI coding agents (Claude Code, Codex) running
-in its panes, so you can see at a glance which window needs your attention and
-jump straight to the pane that is blocked.
+window with the live state of any AI coding agents (Claude Code, Codex, and
+Kimi Code) running in its panes, so you can see at a glance which window needs
+your attention and jump straight to the pane that is blocked.
 
 https://github.com/user-attachments/assets/74f50ead-c774-462d-a619-862d38bb2888
 
@@ -18,9 +18,9 @@ first blocked pane so you land exactly where input is needed.
   runtime dependency; the fuzzy finder is built in (no fzf required)
 - Rust (edition 2024) to build from source
 
-Linux is fully supported. On other platforms the build works, but agent
-classification falls back to the pane's foreground command name (the
-process-tree walk needs `/proc`).
+Linux and macOS are fully supported. On other platforms the build works,
+but agent classification falls back to the pane's foreground command name
+(the process-tree walk needs `/proc` or libproc).
 
 ## Install
 

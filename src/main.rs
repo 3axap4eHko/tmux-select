@@ -94,7 +94,10 @@ fn build_entry(
     for (pane, kind) in agent_panes {
         let state = match client.capture(&pane.pane_id) {
             Ok(screen) => match_state(kind, &screen),
-            Err(_) => AgentState::Idle,
+            Err(error) => {
+                eprintln!("tmux-select: capture-pane {} failed: {error}", pane.pane_id);
+                AgentState::Idle
+            }
         };
         readings.push(AgentReading {
             pane_id: pane.pane_id.clone(),
@@ -132,9 +135,12 @@ fn candidate_for(window: &Window, readings: &[AgentReading]) -> picker::Candidat
         display.push_str(&head);
         display.push_str(state);
         display.push(']');
-        let start = length + head.len();
-        spans.push((start..start + state.len(), state_color(reading.state)));
-        length = start + state.len() + 1;
+        let start = length + head.chars().count();
+        spans.push((
+            start..start + state.chars().count(),
+            state_color(reading.state),
+        ));
+        length = start + state.chars().count() + 1;
         if reading.state == AgentState::Blocked && blocked.is_none() {
             blocked = Some(reading.pane_id.clone());
         }

@@ -217,9 +217,8 @@ fn rank(candidates: &[Candidate], query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(index, candidate)| {
-            fuzzy_score(query, &candidate.display).map(|(score, positions)| {
-                (index, score, positions.first().copied().unwrap_or(0))
-            })
+            fuzzy_score(query, &candidate.display)
+                .map(|(score, positions)| (index, score, positions.first().copied().unwrap_or(0)))
         })
         .collect();
     scored.sort_by(|a, b| {
@@ -422,7 +421,9 @@ mod tests {
     #[test]
     fn contiguous_match_beats_word_starts_flung_across_an_annotation() {
         let contiguous = fuzzy_score("ai", "15: ~/projects/overlaid").unwrap().0;
-        let scattered = fuzzy_score("ai", "13: ~/projects/arpg [claude: idle]").unwrap().0;
+        let scattered = fuzzy_score("ai", "13: ~/projects/arpg [claude: idle]")
+            .unwrap()
+            .0;
         assert!(contiguous > scattered);
     }
 
