@@ -6,15 +6,16 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const SENTINEL: &str = "TMUXSELECT_SENTINEL";
-const PANE_FORMAT: &str = "#{pane_id}\x1f#{window_id}\x1f#{window_index}\x1f#{pane_active}\x1f#{pane_index}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{s|\\n| |:pane_current_path}";
+const PANE_FORMAT: &str = "#{pane_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_index}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{s|\\n| |:pane_current_path}";
 // tmux octal-escapes non-printable bytes in control-mode command output.
 const CONTROL_MODE_PANE_SEPARATOR: &str = r"\037";
-const PANE_FIELDS: usize = 8;
+const PANE_FIELDS: usize = 9;
 
 pub struct Pane {
     pub pane_id: String,
     pub window_id: String,
     pub window_index: u32,
+    pub window_active: bool,
     pub pane_active: bool,
     pub pane_index: u32,
     pub pane_pid: u32,
@@ -198,11 +199,12 @@ fn parse_pane(line: &str) -> Result<Pane> {
         pane_id: fields[0].to_string(),
         window_id: fields[1].to_string(),
         window_index: fields[2].parse()?,
-        pane_active: fields[3] == "1",
-        pane_index: fields[4].parse()?,
-        pane_pid: fields[5].parse()?,
-        current_command: fields[6].to_string(),
-        current_path: fields[7].to_string(),
+        window_active: fields[3] == "1",
+        pane_active: fields[4] == "1",
+        pane_index: fields[5].parse()?,
+        pane_pid: fields[6].parse()?,
+        current_command: fields[7].to_string(),
+        current_path: fields[8].to_string(),
     })
 }
 
@@ -257,13 +259,14 @@ mod tests {
         assert!(PANE_FORMAT.contains(r"#{s|\n| |:pane_current_path}"));
         assert_eq!(
             list_panes_command("$0"),
-            "list-panes -s -t '$0' -F \"#{pane_id}\u{1f}#{window_id}\u{1f}#{window_index}\u{1f}#{pane_active}\u{1f}#{pane_index}\u{1f}#{pane_pid}\u{1f}#{pane_current_command}\u{1f}#{s|\\n| |:pane_current_path}\""
+            "list-panes -s -t '$0' -F \"#{pane_id}\u{1f}#{window_id}\u{1f}#{window_index}\u{1f}#{window_active}\u{1f}#{pane_active}\u{1f}#{pane_index}\u{1f}#{pane_pid}\u{1f}#{pane_current_command}\u{1f}#{s|\\n| |:pane_current_path}\""
         );
     }
 
     #[test]
     fn parses_a_pane_line_after_newline_path_sanitization() {
-        let pane = parse_pane(r"%2\037@0\03712\0371\0373\0372776867\037npm\037/tmp/a b").unwrap();
+        let pane =
+            parse_pane(r"%2\037@0\03712\0371\0371\0373\0372776867\037npm\037/tmp/a b").unwrap();
         assert_eq!(pane.current_path, "/tmp/a b");
     }
 
@@ -313,10 +316,11 @@ TMUXSELECT_SENTINEL
     #[test]
     fn parses_a_pane_line_with_a_pipe_in_the_path() {
         let pane =
-            parse_pane(r"%2\037@0\03712\0371\0373\0372776867\037npm\037/home/me/a|b").unwrap();
+            parse_pane(r"%2\037@0\03712\0371\0371\0373\0372776867\037npm\037/home/me/a|b").unwrap();
         assert_eq!(pane.pane_id, "%2");
         assert_eq!(pane.window_id, "@0");
         assert_eq!(pane.window_index, 12);
+        assert!(pane.window_active);
         assert!(pane.pane_active);
         assert_eq!(pane.pane_index, 3);
         assert_eq!(pane.pane_pid, 2776867);
@@ -326,7 +330,9 @@ TMUXSELECT_SENTINEL
 
     #[test]
     fn parses_a_pane_line_with_a_pipe_in_the_command() {
-        let pane = parse_pane(r"%2\037@0\03712\0371\0373\0372776867\037we|ird\037/tmp/x").unwrap();
+        let pane =
+            parse_pane(r"%2\037@0\03712\0370\0371\0373\0372776867\037we|ird\037/tmp/x").unwrap();
+        assert!(!pane.window_active);
         assert_eq!(pane.current_command, "we|ird");
         assert_eq!(pane.current_path, "/tmp/x");
     }

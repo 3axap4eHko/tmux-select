@@ -52,8 +52,9 @@ satisfies this.
 
 ## Usage
 
-The picker opens with every window of the current session listed. Type to
-fuzzy-filter, move with the arrow keys, press Enter to switch.
+The picker opens with every window of the current session listed and the active
+window preselected. Type to fuzzy-filter, move with the arrow keys, press Enter
+to switch.
 
 ### Keys
 

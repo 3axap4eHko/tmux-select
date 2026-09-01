@@ -29,7 +29,7 @@ pub struct Target {
     pub pane_id: Option<String>,
 }
 
-pub fn pick(candidates: Vec<Candidate>) -> Result<Option<Target>> {
+pub fn pick(candidates: Vec<Candidate>, default_index: usize) -> Result<Option<Target>> {
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -37,13 +37,17 @@ pub fn pick(candidates: Vec<Candidate>) -> Result<Option<Target>> {
         .into_raw_mode()
         .map_err(|error| format!("failed to enter terminal raw mode (not a tty?): {error}"))?;
     let mut screen = raw.into_alternate_screen()?;
-    run(&candidates, &mut screen)
+    run(&candidates, &mut screen, default_index)
 }
 
-fn run<W: Write>(candidates: &[Candidate], screen: &mut W) -> Result<Option<Target>> {
+fn run<W: Write>(
+    candidates: &[Candidate],
+    screen: &mut W,
+    default_index: usize,
+) -> Result<Option<Target>> {
     let mut query = String::new();
     let mut filtered = rank(candidates, &query);
-    let mut selected = 0usize;
+    let mut selected = default_index;
     let mut keys = io::stdin().keys();
 
     loop {

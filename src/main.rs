@@ -25,6 +25,7 @@ fn run() -> Result<()> {
     let panes = client.enumerate(&session)?;
     let pane_pids: HashSet<u32> = panes.iter().map(|pane| pane.pane_pid).collect();
     let windows = group_windows(panes);
+    let default_index = windows.iter().position(|window| window.active).unwrap_or(0);
     let agents = process::classify_panes(&pane_pids);
 
     let mut candidates = Vec::with_capacity(windows.len());
@@ -33,7 +34,7 @@ fn run() -> Result<()> {
     }
     client.detach()?;
 
-    if let Some(target) = picker::pick(candidates)? {
+    if let Some(target) = picker::pick(candidates, default_index)? {
         tmux::switch_to(&target.window_id, target.pane_id.as_deref())?;
     }
     Ok(())
@@ -42,6 +43,7 @@ fn run() -> Result<()> {
 struct Window {
     window_id: String,
     window_index: u32,
+    active: bool,
     path: String,
     panes: Vec<Pane>,
 }
@@ -61,6 +63,7 @@ fn group_windows(panes: Vec<Pane>) -> Vec<Window> {
             Window {
                 window_id: pane.window_id.clone(),
                 window_index: pane.window_index,
+                active: pane.window_active,
                 path: String::new(),
                 panes: Vec::new(),
             }
@@ -161,6 +164,7 @@ mod tests {
         Window {
             window_id: "@3".to_string(),
             window_index: 12,
+            active: false,
             path: "~/api".to_string(),
             panes: Vec::new(),
         }
@@ -226,6 +230,7 @@ mod tests {
                 pane_id: "%5".into(),
                 window_id: "@1".into(),
                 window_index: 2,
+                window_active: false,
                 pane_active: false,
                 pane_index: 1,
                 pane_pid: 5,
@@ -236,6 +241,7 @@ mod tests {
                 pane_id: "%9".into(),
                 window_id: "@1".into(),
                 window_index: 2,
+                window_active: false,
                 pane_active: true,
                 pane_index: 2,
                 pane_pid: 9,
@@ -246,6 +252,7 @@ mod tests {
                 pane_id: "%2".into(),
                 window_id: "@0".into(),
                 window_index: 1,
+                window_active: true,
                 pane_active: true,
                 pane_index: 1,
                 pane_pid: 2,
@@ -256,7 +263,9 @@ mod tests {
         let windows = group_windows(panes);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].window_index, 1);
+        assert!(windows[0].active);
         assert_eq!(windows[1].window_index, 2);
+        assert!(!windows[1].active);
         assert_eq!(windows[1].path, "/active");
     }
 }
