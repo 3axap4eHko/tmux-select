@@ -3,6 +3,10 @@ pub enum AgentKind {
     Claude,
     Codex,
     Kimi,
+    Pi,
+    OpenCode,
+    Qwen,
+    Grok,
 }
 
 impl AgentKind {
@@ -11,6 +15,10 @@ impl AgentKind {
             "claude" => Some(AgentKind::Claude),
             "codex" => Some(AgentKind::Codex),
             "kimi" => Some(AgentKind::Kimi),
+            "pi" => Some(AgentKind::Pi),
+            "opencode" => Some(AgentKind::OpenCode),
+            "qwen" => Some(AgentKind::Qwen),
+            "grok" => Some(AgentKind::Grok),
             _ => None,
         }
     }
@@ -20,6 +28,10 @@ impl AgentKind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Kimi => "kimi",
+            AgentKind::Pi => "pi",
+            AgentKind::OpenCode => "opencode",
+            AgentKind::Qwen => "qwen",
+            AgentKind::Grok => "grok",
         }
     }
 
@@ -34,11 +46,21 @@ impl AgentKind {
         if let Some(kind) = AgentKind::from_name(basename) {
             return Some(kind);
         }
+        if path.ends_with("/qwen-code/node/bin/node") || is_qwen_entry_path(path) {
+            return Some(AgentKind::Qwen);
+        }
         if !is_version_shaped(basename) {
             return None;
         }
         components.find_map(AgentKind::from_name)
     }
+}
+
+pub(crate) fn is_qwen_entry_path(path: &str) -> bool {
+    path.ends_with("/qwen-code/lib/cli-entry.js")
+        || path.ends_with("/qwen-code/lib/cli.js")
+        || path.ends_with("/@qwen-code/qwen-code/cli-entry.js")
+        || path.ends_with("/@qwen-code/qwen-code/cli.js")
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -73,6 +95,13 @@ const LIVE_LINES: usize = 8;
 const CLAUDE_SPINNER: [char; 7] = ['·', '✢', '✳', '✶', '✻', '✽', '*'];
 const KIMI_MOON_SPINNER: [char; 8] = ['🌑', '🌒', '🌓', '🌔', '🌕', '🌖', '🌗', '🌘'];
 const KIMI_BRAILLE_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const PI_BRAILLE_SPINNER: [char; 10] = [
+    '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}',
+    '\u{2807}', '\u{280f}',
+];
+const GROK_BRAILLE_SPINNER: [char; 8] = [
+    '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}',
+];
 const KIMI_SWARM_ACTIVITY: [&str; 5] = [
     "Orchestrating...",
     "Prompting...",
@@ -84,15 +113,39 @@ const KIMI_SWARM_ACTIVITY: [&str; 5] = [
 pub fn match_state(kind: AgentKind, screen: &str) -> AgentState {
     let live = bottom_lines(screen, LIVE_LINES);
 
-    if live.iter().any(|&line| is_blocked(kind, line)) {
+    if live.iter().any(|&line| is_blocked(kind, line))
+        || (kind == AgentKind::Codex
+            && codex_has_menu_options(
+                &live,
+                "Keep current model",
+                "Keep current model (never show again)",
+            ))
+    {
         return AgentState::Blocked;
     }
     if live.iter().any(|&line| is_working(kind, line))
+        || (kind == AgentKind::Codex
+            && codex_has_menu_options(&live, "Dismiss and keep waiting", "Learn more"))
         || (kind == AgentKind::Kimi && kimi_has_active_swarm(&live))
     {
         return AgentState::Working;
     }
     AgentState::Idle
+}
+
+fn codex_has_menu_options(lines: &[&str], first: &str, second: &str) -> bool {
+    let mut options = lines.iter().copied().filter_map(codex_menu_option);
+    options.any(|option| option == first) && options.any(|option| option == second)
+}
+
+fn codex_menu_option(line: &str) -> Option<&str> {
+    let head = line.trim();
+    let head = head.strip_prefix("\u{203a} ").unwrap_or(head);
+    let (number, text) = head.split_once(". ")?;
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(text.split_once("  ").map_or(text, |(label, _)| label))
 }
 
 fn is_working(kind: AgentKind, line: &str) -> bool {
@@ -105,7 +158,70 @@ fn is_working(kind: AgentKind, line: &str) -> bool {
             line.contains("to interrupt)") || line.contains("background terminal running")
         }
         AgentKind::Kimi => kimi_is_working(line),
+        AgentKind::Pi => pi_is_working(line),
+        AgentKind::OpenCode => opencode_is_working(line),
+        AgentKind::Qwen => qwen_is_working(line),
+        AgentKind::Grok => grok_is_working(line),
     }
+}
+
+fn pi_is_working(line: &str) -> bool {
+    let head = line.trim_start();
+    let mut chars = head.chars();
+    let Some(frame) = chars.next() else {
+        return false;
+    };
+    if !PI_BRAILLE_SPINNER.contains(&frame) {
+        return false;
+    }
+    let status = chars.as_str().trim_start();
+    status.starts_with("Working...")
+        || status.starts_with("Retrying (")
+        || status.starts_with("Compacting context...")
+        || status.starts_with("Auto-compacting...")
+        || status.starts_with("Context overflow detected, Auto-compacting...")
+        || status.starts_with("Summarizing branch...")
+}
+
+fn opencode_is_working(line: &str) -> bool {
+    line.contains("esc interrupt") || line.contains("esc again to interrupt")
+}
+
+fn qwen_is_working(line: &str) -> bool {
+    let Some((_, footer)) = line.rsplit_once('(') else {
+        return false;
+    };
+    let Some(status) = footer.strip_suffix(" \u{b7} esc to cancel)") else {
+        return false;
+    };
+    let elapsed = status
+        .split_once(" \u{b7} ")
+        .map_or(status, |(time, _)| time);
+    let mut parts = elapsed.split_whitespace();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    qwen_is_duration_part(first) && parts.all(qwen_is_duration_part)
+}
+
+fn qwen_is_duration_part(part: &str) -> bool {
+    let bytes = part.as_bytes();
+    bytes.len() > 1
+        && matches!(bytes.last(), Some(b'h' | b'm' | b's'))
+        && bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit)
+}
+
+fn grok_is_working(line: &str) -> bool {
+    let head = line.trim_start();
+    if head.contains("[stop]")
+        || head.contains(" still running")
+        || head.contains("send a message to interrupt")
+    {
+        return true;
+    }
+    head.chars()
+        .next()
+        .is_some_and(|frame| GROK_BRAILLE_SPINNER.contains(&frame))
 }
 
 fn kimi_is_working(line: &str) -> bool {
@@ -170,7 +286,52 @@ fn is_blocked(kind: AgentKind, line: &str) -> bool {
                 || (line.contains("to confirm or") && line.contains("to cancel"))
         }
         AgentKind::Kimi => kimi_is_blocked(line),
+        AgentKind::Pi => pi_is_blocked(line),
+        AgentKind::OpenCode => opencode_is_blocked(line),
+        AgentKind::Qwen => qwen_is_blocked(line),
+        AgentKind::Grok => grok_is_blocked(line),
     }
+}
+
+fn pi_is_blocked(line: &str) -> bool {
+    let head = line.trim();
+    (head.starts_with("\u{2191}\u{2193} navigate")
+        && head.contains(" select")
+        && head.ends_with(" cancel"))
+        || (head.contains(" submit  ") && head.ends_with(" cancel"))
+        || head
+            .split_once(" submit  ")
+            .and_then(|(_, hints)| hints.split_once(" newline  "))
+            .and_then(|(_, hints)| hints.split_once(" cancel  "))
+            .is_some_and(|(_, hint)| hint.ends_with(" external editor"))
+}
+
+fn opencode_is_blocked(line: &str) -> bool {
+    let head = line.trim();
+    head.contains("Permission required")
+        || head.contains("Reject permission")
+        || head == "Always allow"
+        || (head.contains("enter ") && head.contains("esc dismiss"))
+}
+
+fn qwen_is_blocked(line: &str) -> bool {
+    line.contains("No, suggest changes (esc)")
+        || line.contains("No, keep planning (esc)")
+        || line.contains("Save and close external editor to continue")
+        || line.contains("A potential loop was detected")
+        || (line.contains("Enter to confirm") && line.contains("Esc to cancel"))
+        || (line.contains("Enter: Select") && line.contains("Esc: Cancel"))
+        || (line.contains("Enter: Confirm") && line.contains("Esc: Cancel"))
+}
+
+fn grok_is_blocked(line: &str) -> bool {
+    let head = line.trim_start();
+    let waiting_diamond = head.starts_with('\u{25c6}') || head.starts_with('\u{2666}');
+    (waiting_diamond && head.contains("[stop]"))
+        || head.contains("Waiting on plan approval")
+        || head.contains("No plan written: approve or request changes")
+        || (head.contains("always-approve") && head.contains("cancel"))
+        || (head.contains("next answer") && head.contains("dismiss"))
 }
 
 fn kimi_is_blocked(line: &str) -> bool {
@@ -208,6 +369,10 @@ mod tests {
         assert_eq!(AgentKind::from_name("claude"), Some(AgentKind::Claude));
         assert_eq!(AgentKind::from_name("codex"), Some(AgentKind::Codex));
         assert_eq!(AgentKind::from_name("kimi"), Some(AgentKind::Kimi));
+        assert_eq!(AgentKind::from_name("pi"), Some(AgentKind::Pi));
+        assert_eq!(AgentKind::from_name("opencode"), Some(AgentKind::OpenCode));
+        assert_eq!(AgentKind::from_name("qwen"), Some(AgentKind::Qwen));
+        assert_eq!(AgentKind::from_name("grok"), Some(AgentKind::Grok));
         assert_eq!(AgentKind::from_name("npm"), None);
         assert_eq!(AgentKind::from_name("node"), None);
     }
@@ -227,6 +392,18 @@ mod tests {
             AgentKind::from_path("/home/me/.kimi-code/bin/kimi"),
             Some(AgentKind::Kimi)
         );
+        assert_eq!(
+            AgentKind::from_path("/home/me/.opencode/bin/opencode"),
+            Some(AgentKind::OpenCode)
+        );
+        assert_eq!(
+            AgentKind::from_path("/home/me/.local/bin/qwen"),
+            Some(AgentKind::Qwen)
+        );
+        assert_eq!(
+            AgentKind::from_path("/home/me/.local/bin/grok"),
+            Some(AgentKind::Grok)
+        );
         assert_eq!(AgentKind::from_path("/usr/local/bin/node"), None);
     }
 
@@ -243,6 +420,19 @@ mod tests {
     }
 
     #[test]
+    fn from_path_matches_qwen_node_launchers() {
+        for path in [
+            "/home/me/.local/lib/qwen-code/node/bin/node",
+            "/home/me/.local/lib/qwen-code/lib/cli-entry.js",
+            "/usr/lib/node_modules/@qwen-code/qwen-code/lib/cli.js",
+            "/usr/lib/node_modules/@qwen-code/qwen-code/cli-entry.js",
+            "/usr/lib/node_modules/@qwen-code/qwen-code/cli.js",
+        ] {
+            assert_eq!(AgentKind::from_path(path), Some(AgentKind::Qwen), "{path}");
+        }
+    }
+
+    #[test]
     fn from_path_rejects_version_binaries_outside_agent_directories_and_vice_versa() {
         assert_eq!(AgentKind::from_path("/opt/foo/versions/2.1.173"), None);
         assert_eq!(
@@ -250,6 +440,14 @@ mod tests {
             None
         );
         assert_eq!(AgentKind::from_path("/opt/claude/versions/2.1.173b"), None);
+        assert_eq!(
+            AgentKind::from_path("/Users/me/projects/qwen-code/test.js"),
+            None
+        );
+        assert_eq!(
+            AgentKind::from_path("/usr/lib/node_modules/@qwen-code/qwen-code/scripts/test.js"),
+            None
+        );
         assert_eq!(AgentKind::from_path(""), None);
     }
 
@@ -394,6 +592,165 @@ mod tests {
     fn codex_plain_prompt_is_idle() {
         let screen = "$ cargo build\nbuild succeeded\n› \nctrl+t to view transcript\n";
         assert_eq!(match_state(AgentKind::Codex, screen), AgentState::Idle);
+    }
+
+    // Preserve upstream wrapping and column spacing so fixtures catch label/description overlap.
+    // https://github.com/openai/codex/tree/b1a547b1f73ce86205d9222ac19cff334b3b7a2e/codex-rs/tui/src/chatwidget/snapshots
+    const CODEX_WAITING_WITH_RETRY: &str = concat!(
+        "  Our systems are thinking a bit more about this request before responding.\n",
+        "  Hang tight or retry with a faster model for a quicker response, though it\n",
+        "  may be less capable of handling complex requests.\n",
+        "\n",
+        "\u{203a} 1. Retry with a faster model\n",
+        "  2. Dismiss and keep waiting\n",
+        "  3. Learn more\n",
+        "\n",
+        "  No action is required. Codex will keep waiting, and this menu will close when\n",
+        "  the response is ready.\n",
+    );
+    const CODEX_WAITING_WITHOUT_RETRY: &str = concat!(
+        "  Our systems are thinking a bit more about this request before responding.\n",
+        "\n",
+        "\u{203a} 1. Dismiss and keep waiting\n",
+        "  2. Learn more\n",
+        "\n",
+        "  No action is required. Codex will keep waiting, and this menu will close when\n",
+        "  the response is ready.\n",
+    );
+    const CODEX_RATE_LIMIT_SWITCH: &str = concat!(
+        "  Approaching rate limits\n",
+        "  Switch to gpt-5.6-luna for lower credit usage?\n",
+        "\n",
+        "\u{203a} 1. Switch to gpt-5.6-luna                 Fast and affordable agentic coding\n",
+        "                                            model.\n",
+        "  2. Keep current model\n",
+        "  3. Keep current model (never show again)  Hide future rate limit reminders\n",
+        "                                            about switching models.\n",
+        "\n",
+        "  Press enter to confirm or esc to go back\n",
+    );
+
+    #[test]
+    fn codex_waiting_menus_are_working() {
+        for screen in [CODEX_WAITING_WITH_RETRY, CODEX_WAITING_WITHOUT_RETRY] {
+            assert_eq!(match_state(AgentKind::Codex, screen), AgentState::Working);
+        }
+    }
+
+    #[test]
+    fn codex_rate_limit_switch_is_blocked() {
+        assert_eq!(
+            match_state(AgentKind::Codex, CODEX_RATE_LIMIT_SWITCH),
+            AgentState::Blocked
+        );
+    }
+
+    #[test]
+    fn codex_menu_selection_does_not_change_state() {
+        for (screen, count, expected) in [
+            (CODEX_WAITING_WITH_RETRY, 3, AgentState::Working),
+            (CODEX_WAITING_WITHOUT_RETRY, 2, AgentState::Working),
+            (CODEX_RATE_LIMIT_SWITCH, 3, AgentState::Blocked),
+        ] {
+            let unselected = screen.replace('\u{203a}', " ");
+            assert_eq!(match_state(AgentKind::Codex, &unselected), expected);
+            for selected in 1..=count {
+                let screen = unselected.replacen(
+                    &format!("  {selected}. "),
+                    &format!("\u{203a} {selected}. "),
+                    1,
+                );
+                assert_eq!(match_state(AgentKind::Codex, &screen), expected, "{screen}");
+            }
+        }
+    }
+
+    #[test]
+    fn codex_rate_limit_switch_accepts_other_models() {
+        let screen = CODEX_RATE_LIMIT_SWITCH.replace("gpt-5.6-luna", "another-model");
+        assert_eq!(match_state(AgentKind::Codex, &screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn codex_isolated_menu_lines_and_unnumbered_prose_are_idle() {
+        for screen in [
+            CODEX_WAITING_WITH_RETRY,
+            CODEX_WAITING_WITHOUT_RETRY,
+            CODEX_RATE_LIMIT_SWITCH,
+        ] {
+            for line in screen.lines() {
+                assert_eq!(
+                    match_state(AgentKind::Codex, line),
+                    AgentState::Idle,
+                    "{line}"
+                );
+            }
+            let prose = screen
+                .replace("\u{203a} 1. ", "")
+                .replace("  2. ", "")
+                .replace("  3. ", "");
+            assert_eq!(match_state(AgentKind::Codex, &prose), AgentState::Idle);
+        }
+    }
+
+    #[test]
+    fn codex_menus_require_complete_numbered_labels_in_order() {
+        for screen in [
+            "  1. Learn more\n  2. Dismiss and keep waiting\n",
+            "  2. Keep current model (never show again)\n  3. Keep current model\n",
+            "  2. Keep current model (never show again)\n  3. Keep current model (never show again)\n",
+            "  1. Dismiss and keep waiting now\n  2. Learn more\n",
+            "  1. Dismiss and keep waiting\n  2. Learn more about models\n",
+            "  2. Keep current model settings\n  3. Keep current model (never show again)\n",
+            "  2. Keep current model\n  3. Keep current model (never show again) please\n",
+            "  x. Dismiss and keep waiting\n  2. Learn more\n",
+            "  . Dismiss and keep waiting\n  2. Learn more\n",
+            "  2. Keep current model\n  x. Keep current model (never show again)\n",
+        ] {
+            assert_eq!(
+                match_state(AgentKind::Codex, screen),
+                AgentState::Idle,
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_blocked_menus_win_over_working() {
+        let switching_while_working = CODEX_RATE_LIMIT_SWITCH.replace(
+            "  Approaching rate limits",
+            "Working (1s - esc to interrupt)",
+        );
+        let switching_while_waiting =
+            format!("{CODEX_RATE_LIMIT_SWITCH}  1. Dismiss and keep waiting\n  2. Learn more\n");
+        let approval_while_waiting =
+            format!("{CODEX_WAITING_WITH_RETRY}Press enter to confirm or esc to cancel\n");
+        for screen in [
+            switching_while_working,
+            switching_while_waiting,
+            approval_while_waiting,
+        ] {
+            assert_eq!(match_state(AgentKind::Codex, &screen), AgentState::Blocked);
+        }
+    }
+
+    #[test]
+    fn codex_menu_options_must_both_fit_in_the_live_region() {
+        for (options, expected) in [
+            (
+                "  1. Dismiss and keep waiting\n  2. Learn more\n",
+                AgentState::Working,
+            ),
+            (
+                "  2. Keep current model\n  3. Keep current model (never show again)\n",
+                AgentState::Blocked,
+            ),
+        ] {
+            for (filler_count, state) in [(6, expected), (7, AgentState::Idle)] {
+                let screen = format!("{options}{}", "transcript line\n\n".repeat(filler_count));
+                assert_eq!(match_state(AgentKind::Codex, &screen), state);
+            }
+        }
     }
 
     #[test]
@@ -544,6 +901,192 @@ Working... final response
     }
 
     #[test]
+    fn pi_loader_activity_is_working() {
+        for frame in PI_BRAILLE_SPINNER {
+            for status in [
+                "Working...",
+                "Working... (esc to interrupt)",
+                "Retrying (1/3) in 2s...",
+                "Compacting context...",
+                "Auto-compacting...",
+                "Context overflow detected, Auto-compacting... (esc to cancel)",
+                "Summarizing branch...",
+            ] {
+                let screen = format!("tool output\n  {frame} {status}\n> \n");
+                assert_eq!(
+                    match_state(AgentKind::Pi, &screen),
+                    AgentState::Working,
+                    "{frame} {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pi_extension_prompts_are_blocked() {
+        for footer in [
+            "\u{2191}\u{2193} navigate  enter select  esc cancel",
+            "enter submit  esc cancel",
+            "enter submit  shift+enter newline  esc cancel  ctrl+g external editor",
+            "ctrl+s submit  ctrl+j newline  ctrl+c cancel  ctrl+e external editor",
+        ] {
+            let screen = format!("Extension prompt\n  option\n{footer}\n");
+            assert_eq!(
+                match_state(AgentKind::Pi, &screen),
+                AgentState::Blocked,
+                "{footer}"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_multiline_editor_prompt_wins_over_spinner() {
+        let screen = "\u{280b} Working...\nEdit response\n> draft\nenter submit  shift+enter newline  esc cancel  ctrl+g external editor\n";
+        assert_eq!(match_state(AgentKind::Pi, screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn pi_unrelated_loader_is_idle() {
+        let screen = format!("{} Downloading update\n> \n", PI_BRAILLE_SPINNER[0]);
+        assert_eq!(match_state(AgentKind::Pi, &screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn pi_overflow_compaction_text_without_spinner_is_idle() {
+        let screen = "Context overflow detected, Auto-compacting... (esc to cancel)\n> \n";
+        assert_eq!(match_state(AgentKind::Pi, screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn opencode_busy_prompt_is_working() {
+        for footer in ["esc interrupt", "esc again to interrupt"] {
+            let screen = format!("Build project\n{footer}\n");
+            assert_eq!(
+                match_state(AgentKind::OpenCode, &screen),
+                AgentState::Working,
+                "{footer}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_permission_and_question_prompts_are_blocked() {
+        for marker in [
+            "Permission required",
+            "Reject permission",
+            "Always allow",
+            "enter submit  esc dismiss",
+            "enter toggle  esc dismiss",
+            "enter confirm  esc dismiss",
+        ] {
+            let screen = format!("prompt\n{marker}\n");
+            assert_eq!(
+                match_state(AgentKind::OpenCode, &screen),
+                AgentState::Blocked,
+                "{marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_plain_prompt_is_idle() {
+        assert_eq!(
+            match_state(AgentKind::OpenCode, "Ask anything\nctrl+x leader\n"),
+            AgentState::Idle
+        );
+    }
+
+    #[test]
+    fn qwen_responding_status_is_working() {
+        for status in [
+            ". Working (4s \u{b7} esc to cancel)",
+            ".. Responding (12s \u{b7} \u{2193} 641 tokens \u{b7} esc to cancel)",
+            ".. Responding (1m 12s \u{b7} \u{2193} 1.2k tokens \u{b7} 16 t/s \u{b7} esc to cancel)",
+        ] {
+            assert_eq!(
+                match_state(AgentKind::Qwen, &format!("{status}\n")),
+                AgentState::Working,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen_confirmation_prompts_are_blocked() {
+        for marker in [
+            "No, suggest changes (esc)",
+            "No, keep planning (esc)",
+            "Save and close external editor to continue",
+            "A potential loop was detected",
+            "Enter to confirm, Esc to cancel",
+            "Enter to confirm \u{b7} Esc to cancel",
+            "Up/Down: Navigate | Enter: Select | Esc: Cancel",
+            "Up/Down: Navigate | Enter: Confirm | Esc: Cancel",
+        ] {
+            assert_eq!(
+                match_state(AgentKind::Qwen, &format!("prompt\n{marker}\n")),
+                AgentState::Blocked,
+                "{marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen_non_progress_status_is_idle() {
+        for status in [". Waiting", "(Esc to cancel)"] {
+            assert_eq!(
+                match_state(AgentKind::Qwen, &format!("{status}\n")),
+                AgentState::Idle,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_turn_activity_is_working() {
+        for line in [
+            format!("{} Thinking... 2s [stop]", GROK_BRAILLE_SPINNER[0]),
+            format!("{} Starting session... 0:01", GROK_BRAILLE_SPINNER[1]),
+            "waiting - send a message to interrupt".to_string(),
+            "1 command still running".to_string(),
+        ] {
+            assert_eq!(
+                match_state(AgentKind::Grok, &format!("{line}\n")),
+                AgentState::Working,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_user_waits_are_blocked() {
+        for line in [
+            "\u{25c6} Run command 2s [stop]",
+            "Waiting on plan approval",
+            "No plan written: approve or request changes",
+            "1-4 select  Ctrl+O always-approve  Ctrl+C cancel",
+            "Tab next answer  Esc back  X dismiss",
+        ] {
+            assert_eq!(
+                match_state(AgentKind::Grok, &format!("{line}\n")),
+                AgentState::Blocked,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_idle_edit_prompt_is_idle() {
+        assert_eq!(
+            match_state(
+                AgentKind::Grok,
+                "\u{25c6} agent idle - waiting on your edit\n"
+            ),
+            AgentState::Idle
+        );
+    }
+
+    #[test]
     fn frozen_transcript_is_idle() {
         let screen = "✻ Crunched for 6m 41s\n✻ Waiting for 1 dynamic workflow to finish\n● Dynamic workflow \"x\" completed · 11s\n✻ Churned for 43s\n  7 tasks (6 done, 1 open)\n  ◻ a\n  ✔ b\n  ✔ c\n  … +2 completed\n────────────\n❯ sequence the fixes, critical first\n────────────\n  ~/projects/arpg  claude  75%\n  ⏵⏵ auto mode on\n";
         assert_eq!(match_state(AgentKind::Claude, screen), AgentState::Idle);
@@ -570,5 +1113,9 @@ Working... final response
         assert_eq!(match_state(AgentKind::Claude, ""), AgentState::Idle);
         assert_eq!(match_state(AgentKind::Codex, ""), AgentState::Idle);
         assert_eq!(match_state(AgentKind::Kimi, ""), AgentState::Idle);
+        assert_eq!(match_state(AgentKind::Pi, ""), AgentState::Idle);
+        assert_eq!(match_state(AgentKind::OpenCode, ""), AgentState::Idle);
+        assert_eq!(match_state(AgentKind::Qwen, ""), AgentState::Idle);
+        assert_eq!(match_state(AgentKind::Grok, ""), AgentState::Idle);
     }
 }

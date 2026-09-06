@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::agent::AgentKind;
+use crate::agent::{AgentKind, is_qwen_entry_path};
 
 type Parent = HashMap<u32, u32>;
 type Agents = Vec<(u32, AgentKind)>;
@@ -50,13 +50,40 @@ fn collect_processes(parent: &mut Parent, agents: &mut Agents) {
         }
         if let Some(stat) = parse_stat(&String::from_utf8_lossy(&buf)) {
             parent.insert(pid, stat.ppid);
-            if let Some(kind) = AgentKind::from_name(stat.comm)
-                && i64::from(stat.pgrp) == stat.tpgid
-            {
+            if i64::from(stat.pgrp) != stat.tpgid {
+                continue;
+            }
+            let kind = AgentKind::from_name(stat.comm).or_else(|| {
+                if stat.comm == "node" {
+                    classify_qwen_node(pid)
+                } else {
+                    None
+                }
+            });
+            if let Some(kind) = kind {
                 agents.push((pid, kind));
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_qwen_node(pid: u32) -> Option<AgentKind> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    qwen_from_cmdline(&cmdline)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn qwen_from_cmdline(cmdline: &[u8]) -> Option<AgentKind> {
+    let mut args = cmdline.split(|&byte| byte == 0).skip(1);
+    let first = args.next()?;
+    // The packaged launcher respawns cli.js with --expose-gc.
+    let entry = if first == b"--expose-gc" {
+        args.next()?
+    } else {
+        first
+    };
+    is_qwen_entry_path(std::str::from_utf8(entry).ok()?).then_some(AgentKind::Qwen)
 }
 
 // In-process libproc reads instead of spawning ps: every exec on a managed Mac is
@@ -211,6 +238,48 @@ mod tests {
     fn parse_stat_keeps_processes_with_no_controlling_terminal() {
         let stat = parse_stat("3 (kthreadd) S 2 0 0 0 -1 0").unwrap();
         assert_eq!((stat.ppid, stat.pgrp, stat.tpgid), (2, 0, -1));
+    }
+
+    #[test]
+    fn qwen_node_cmdline_matches_only_the_packaged_cli() {
+        for cmdline in [
+            b"/home/me/.local/lib/qwen-code/node/bin/node\0/home/me/.local/lib/qwen-code/lib/cli-entry.js\0".as_slice(),
+            b"/home/me/.local/lib/qwen-code/node/bin/node\0--expose-gc\0/home/me/.local/lib/qwen-code/lib/cli.js\0",
+            b"/usr/bin/node\0/usr/lib/node_modules/@qwen-code/qwen-code/cli-entry.js\0",
+            b"/usr/bin/node\0--expose-gc\0/usr/lib/node_modules/@qwen-code/qwen-code/cli.js\0",
+            b"/usr/bin/node\0/usr/lib/node_modules/@qwen-code/qwen-code/lib/cli.js\0--help\0",
+        ] {
+            assert_eq!(qwen_from_cmdline(cmdline), Some(AgentKind::Qwen));
+        }
+    }
+
+    #[test]
+    fn qwen_node_cmdline_rejects_unrelated_scripts_and_arguments() {
+        for cmdline in [
+            b"/usr/bin/node\0/Users/me/projects/qwen-code/test.js\0".as_slice(),
+            b"/usr/bin/node\0/tmp/agents/qwen\0",
+            b"/usr/bin/node\0/tmp/agents/app.js\0qwen\0",
+            b"/usr/bin/node\0/tmp/agents/app.js\0/usr/lib/node_modules/@qwen-code/qwen-code/cli.js\0",
+            b"/usr/bin/node\0--expose-gc\0/tmp/agents/app.js\0/usr/lib/node_modules/@qwen-code/qwen-code/cli.js\0",
+            b"/usr/bin/node\0-e\0/usr/lib/node_modules/@qwen-code/qwen-code/cli.js\0",
+            b"/usr/bin/node\0-r\0/usr/lib/node_modules/@qwen-code/qwen-code/cli.js\0/tmp/agents/app.js\0",
+            b"/usr/bin/node\0/usr/lib/node_modules/@qwen-code/qwen-code/scripts/test.js\0",
+            b"/home/me/.local/lib/qwen-code/node/bin/node\0/tmp/agents/app.js\0",
+        ] {
+            assert_eq!(qwen_from_cmdline(cmdline), None, "{cmdline:?}");
+        }
+    }
+
+    #[test]
+    fn qwen_node_cmdline_rejects_missing_or_invalid_entries() {
+        for cmdline in [
+            b"".as_slice(),
+            b"/usr/bin/node\0",
+            b"/usr/bin/node\0--expose-gc\0",
+            b"/usr/bin/node\0/tmp/agents/\xff.js\0/usr/lib/node_modules/@qwen-code/qwen-code/cli.js\0",
+        ] {
+            assert_eq!(qwen_from_cmdline(cmdline), None, "{cmdline:?}");
+        }
     }
 
     #[test]
