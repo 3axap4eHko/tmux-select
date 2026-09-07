@@ -56,6 +56,8 @@ fn collect_processes(parent: &mut Parent, agents: &mut Agents) {
             let kind = AgentKind::from_name(stat.comm).or_else(|| {
                 if stat.comm == "node" {
                     classify_qwen_node(pid)
+                } else if stat.comm.starts_with("muse-bin-") {
+                    classify_muse_binary(pid)
                 } else {
                     None
                 }
@@ -65,6 +67,13 @@ fn collect_processes(parent: &mut Parent, agents: &mut Agents) {
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_muse_binary(pid: u32) -> Option<AgentKind> {
+    // Linux truncates Muse's versioned executable name to 15 bytes in comm.
+    let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    AgentKind::from_name(executable.file_name()?.to_str()?).filter(|kind| *kind == AgentKind::Muse)
 }
 
 #[cfg(target_os = "linux")]

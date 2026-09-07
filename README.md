@@ -3,9 +3,9 @@
 An agent-aware tmux window picker. It replaces the usual
 `list-windows | fzf | select-window` binding with a picker that annotates each
 window with the live state of any AI coding agents (Claude Code, Codex, Kimi
-Code, Pi, OpenCode, Qwen Code, and Grok Build) running in its panes, so you can
-see at a glance which window needs your attention and jump straight to the pane
-that is blocked.
+Code, Pi, OpenCode, Qwen Code, Grok Build, and Muse Code) running in its panes,
+so you can see at a glance which window needs your attention and jump straight
+to the pane that is blocked.
 
 https://github.com/user-attachments/assets/74f50ead-c774-462d-a619-862d38bb2888
 

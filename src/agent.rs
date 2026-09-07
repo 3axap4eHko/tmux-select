@@ -7,6 +7,7 @@ pub enum AgentKind {
     OpenCode,
     Qwen,
     Grok,
+    Muse,
 }
 
 impl AgentKind {
@@ -19,6 +20,8 @@ impl AgentKind {
             "opencode" => Some(AgentKind::OpenCode),
             "qwen" => Some(AgentKind::Qwen),
             "grok" => Some(AgentKind::Grok),
+            "muse" => Some(AgentKind::Muse),
+            _ if muse_is_binary_name(name) => Some(AgentKind::Muse),
             _ => None,
         }
     }
@@ -32,6 +35,7 @@ impl AgentKind {
             AgentKind::OpenCode => "opencode",
             AgentKind::Qwen => "qwen",
             AgentKind::Grok => "grok",
+            AgentKind::Muse => "muse",
         }
     }
 
@@ -52,8 +56,31 @@ impl AgentKind {
         if !is_version_shaped(basename) {
             return None;
         }
-        components.find_map(AgentKind::from_name)
+        components
+            .find_map(|name| AgentKind::from_name(name).filter(|kind| *kind != AgentKind::Muse))
     }
+}
+
+fn muse_is_binary_name(name: &str) -> bool {
+    let Some((version, release)) = name
+        .strip_prefix("muse-bin-")
+        .and_then(|version| version.split_once("-R"))
+    else {
+        return false;
+    };
+    let mut components = version.split('.');
+    (0..3).all(|_| components.next().is_some_and(is_decimal_component))
+        && components.next().is_none()
+        && match release.split_once('.') {
+            Some((build, revision)) => {
+                is_decimal_component(build) && is_decimal_component(revision)
+            }
+            None => is_decimal_component(release),
+        }
+}
+
+fn is_decimal_component(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 pub(crate) fn is_qwen_entry_path(path: &str) -> bool {
@@ -115,17 +142,18 @@ pub fn match_state(kind: AgentKind, screen: &str) -> AgentState {
 
     if live.iter().any(|&line| is_blocked(kind, line))
         || (kind == AgentKind::Codex
-            && codex_has_menu_options(
+            && has_menu_options(
                 &live,
                 "Keep current model",
                 "Keep current model (never show again)",
             ))
+        || (kind == AgentKind::Muse && muse_is_blocked(&live))
     {
         return AgentState::Blocked;
     }
     if live.iter().any(|&line| is_working(kind, line))
         || (kind == AgentKind::Codex
-            && codex_has_menu_options(&live, "Dismiss and keep waiting", "Learn more"))
+            && has_menu_options(&live, "Dismiss and keep waiting", "Learn more"))
         || (kind == AgentKind::Kimi && kimi_has_active_swarm(&live))
     {
         return AgentState::Working;
@@ -133,12 +161,12 @@ pub fn match_state(kind: AgentKind, screen: &str) -> AgentState {
     AgentState::Idle
 }
 
-fn codex_has_menu_options(lines: &[&str], first: &str, second: &str) -> bool {
-    let mut options = lines.iter().copied().filter_map(codex_menu_option);
+fn has_menu_options(lines: &[&str], first: &str, second: &str) -> bool {
+    let mut options = lines.iter().copied().filter_map(numbered_menu_option);
     options.any(|option| option == first) && options.any(|option| option == second)
 }
 
-fn codex_menu_option(line: &str) -> Option<&str> {
+fn numbered_menu_option(line: &str) -> Option<&str> {
     let head = line.trim();
     let head = head.strip_prefix("\u{203a} ").unwrap_or(head);
     let (number, text) = head.split_once(". ")?;
@@ -162,6 +190,14 @@ fn is_working(kind: AgentKind, line: &str) -> bool {
         AgentKind::OpenCode => opencode_is_working(line),
         AgentKind::Qwen => qwen_is_working(line),
         AgentKind::Grok => grok_is_working(line),
+        AgentKind::Muse => {
+            let head = line.trim();
+            (head.starts_with("\u{25c6} ")
+                || head.starts_with("\u{25c7} ")
+                || head.starts_with("\u{25c8} "))
+                && head.contains(" (")
+                && head.ends_with(" \u{b7} esc to interrupt)")
+        }
     }
 }
 
@@ -290,7 +326,40 @@ fn is_blocked(kind: AgentKind, line: &str) -> bool {
         AgentKind::OpenCode => opencode_is_blocked(line),
         AgentKind::Qwen => qwen_is_blocked(line),
         AgentKind::Grok => grok_is_blocked(line),
+        AgentKind::Muse => line.trim() == "Use Up/Down or 1/2, then Enter. Esc quits.",
     }
+}
+
+fn muse_is_blocked(lines: &[&str]) -> bool {
+    let question = lines
+        .iter()
+        .position(|line| {
+            let head = line.trim_start();
+            head.starts_with("Enter to select \u{b7} ")
+                || head.starts_with("Enter to toggle \u{b7} ")
+        })
+        .is_some_and(|start| {
+            let hints = lines
+                .iter()
+                .skip(start)
+                .map(|line| line.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            hints.contains("Tab for an optional note") && hints.contains("Esc to interrupt")
+        });
+    if question
+        || has_menu_options(
+            lines,
+            "Allow this stage once (y)",
+            "Abort the entire command (esc)",
+        )
+    {
+        return true;
+    }
+    let mut options = lines.iter().copied().filter_map(numbered_menu_option);
+    // Muse truncates this rejection label at 48 columns instead of wrapping it.
+    options.any(|option| option == "Yes, proceed (y)")
+        && options.any(|option| option.starts_with("No, and tell Muse Code "))
 }
 
 fn pi_is_blocked(line: &str) -> bool {
@@ -359,6 +428,438 @@ fn bottom_lines(screen: &str, n: usize) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Preserve native Muse 1.0.3-R2198.1 wrapping and live-line counts: narrow
+    // dialogs hide their headers. ASCII borders keep the escaped fixtures readable.
+    const MUSE_CAPTURES: &[(&str, AgentState, &str)] = &[
+        (
+            "approval-48.txt",
+            AgentState::Blocked,
+            concat!(
+                "  $ pwd\n",
+                "  Stage 1/1\n",
+                "  Current argv: [\"pwd\"]\n",
+                "\u{203a} 1. Allow this stage once (y)\n",
+                "  2. Always allow in this workspace: pwd ... (p)\n",
+                "  3. Abort the entire command (esc)\n",
+                "------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} \u{2026}/workspace\n",
+            ),
+        ),
+        (
+            "approval-80.txt",
+            AgentState::Blocked,
+            concat!(
+                "  $ pwd\n",
+                "  Stage 1/1\n",
+                "  Current argv: [\"pwd\"]\n",
+                "\u{203a} 1. Allow this stage once (y)\n",
+                "  2. Always allow in this workspace: pwd ... (p)\n",
+                "  3. Abort the entire command (esc)\n",
+                "--------------------------------------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} /t/a/muse-dialog-captures-459c3eb1b710fed1/workspace\n",
+            ),
+        ),
+        (
+            "approval-interaction-48.txt",
+            AgentState::Idle,
+            concat!(
+                "\u{27e9} Display the local approval probe\n",
+                "\u{25c6} Ran pwd \u{2014} denied\n",
+                "  \u{2514} approval aborted\n",
+                "\u{25c6} Local probe complete.\n",
+                "------------------------------------------------\n",
+                "\u{27e9}\n",
+                "------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} \u{2026}/workspace\n",
+            ),
+        ),
+        (
+            "approval-interaction-80.txt",
+            AgentState::Idle,
+            concat!(
+                "\u{27e9} Display the local approval probe\n",
+                "\u{25c6} Ran pwd \u{2014} denied\n",
+                "  \u{2514} approval aborted\n",
+                "\u{25c6} Local probe complete.\n",
+                "--------------------------------------------------------------------------------\n",
+                "\u{27e9}\n",
+                "--------------------------------------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} /t/a/muse-dialog-captures-459c3eb1b710fed1/workspace\n",
+            ),
+        ),
+        (
+            "escalation-48.txt",
+            AgentState::Blocked,
+            concat!(
+                "\u{25c6} Calling tools (0s \u{b7} esc to interrupt)\n",
+                "------------------------------------------------\n",
+                "Would you like to run the following command?\n",
+                "  $ pwd\n",
+                "\u{203a} 1. Yes, proceed (y)\n",
+                "  2. No, and tell Muse Code what to do different\n",
+                "------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} \u{2026}/workspace\n",
+            ),
+        ),
+        (
+            "escalation-80.txt",
+            AgentState::Blocked,
+            concat!(
+                "\u{25c7} Calling tools (0s \u{b7} esc to interrupt)\n",
+                "--------------------------------------------------------------------------------\n",
+                "Would you like to run the following command?\n",
+                "  $ pwd\n",
+                "\u{203a} 1. Yes, proceed (y)\n",
+                "  2. No, and tell Muse Code what to do differently (esc)\n",
+                "--------------------------------------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} /t/a/muse-dialog-captures-459c3eb1b710fed1/workspace\n",
+            ),
+        ),
+        (
+            "escalation-interaction-48.txt",
+            AgentState::Idle,
+            concat!(
+                "\u{27e9} Display the local escalation probe\n",
+                "\u{25c6} Ran pwd \u{2014} denied\n",
+                "  \u{2514} approval aborted\n",
+                "\u{25c6} Local probe complete.\n",
+                "------------------------------------------------\n",
+                "\u{27e9}\n",
+                "------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} \u{2026}/workspace\n",
+            ),
+        ),
+        (
+            "escalation-interaction-80.txt",
+            AgentState::Idle,
+            concat!(
+                "\u{27e9} Display the local escalation probe\n",
+                "\u{25c6} Ran pwd \u{2014} denied\n",
+                "  \u{2514} approval aborted\n",
+                "\u{25c6} Local probe complete.\n",
+                "--------------------------------------------------------------------------------\n",
+                "\u{27e9}\n",
+                "--------------------------------------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} /t/a/muse-dialog-captures-459c3eb1b710fed1/workspace\n",
+            ),
+        ),
+        (
+            "multiple-48.txt",
+            AgentState::Blocked,
+            concat!(
+                "    4. Submit answer (0 checked)\n",
+                "  Enter to toggle \u{b7} Submit row to continue \u{b7} \u{2191}/\u{2193}\n",
+                "  to move \u{b7} Tab for an optional note \u{b7} Esc to\n",
+                "  interrupt\n",
+                "------------------------------------------------\n",
+                "\u{27e9}\n",
+                "------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} \u{2026}/workspace\n",
+            ),
+        ),
+        (
+            "multiple-80.txt",
+            AgentState::Blocked,
+            concat!(
+                "    3. [ ] None of the above  Optionally, add details in notes (tab).\n",
+                "    4. Submit answer (0 checked)\n",
+                "  Enter to toggle \u{b7} Submit row to continue \u{b7} \u{2191}/\u{2193} to move \u{b7} Tab for an optional\n",
+                "  note \u{b7} Esc to interrupt\n",
+                "--------------------------------------------------------------------------------\n",
+                "\u{27e9}\n",
+                "--------------------------------------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} /t/a/muse-dialog-captures-459c3eb1b710fed1/workspace\n",
+            ),
+        ),
+        (
+            "questions-48.txt",
+            AgentState::Blocked,
+            concat!(
+                "  1 of 2\n",
+                "  Enter to select \u{b7} \u{2191}/\u{2193} to move \u{b7} \u{2190}/\u{2192} to switch\n",
+                "  question \u{b7} Tab for an optional note \u{b7} Esc to\n",
+                "  interrupt\n",
+                "------------------------------------------------\n",
+                "\u{27e9}\n",
+                "------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} \u{2026}/workspace\n",
+            ),
+        ),
+        (
+            "questions-80.txt",
+            AgentState::Blocked,
+            concat!(
+                "    3. None of the above  Optionally, add details in notes (tab).\n",
+                "  1 of 2\n",
+                "  Enter to select \u{b7} \u{2191}/\u{2193} to move \u{b7} \u{2190}/\u{2192} to switch question \u{b7} Tab for an optional\n",
+                "  note \u{b7} Esc to interrupt\n",
+                "--------------------------------------------------------------------------------\n",
+                "\u{27e9}\n",
+                "--------------------------------------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} /t/a/muse-dialog-captures-459c3eb1b710fed1/workspace\n",
+            ),
+        ),
+        (
+            "running-48",
+            AgentState::Working,
+            concat!(
+                "  Muse Code 1.0.3\n",
+                "\u{27e9} status detection probe\n",
+                "\u{25c7} Thinking (1s \u{b7} esc to interrupt)\n",
+                "------------------------------------------------\n",
+                "\u{27e9}\n",
+                "------------------------------------------------\n",
+                "  echo \u{b7} \u{2026}/workspace\n",
+            ),
+        ),
+        (
+            "running-80",
+            AgentState::Working,
+            concat!(
+                "  Muse Code 1.0.3\n",
+                "\u{27e9} status detection probe\n",
+                "\u{25c6} Thinking (0s \u{b7} esc to interrupt)\n",
+                "--------------------------------------------------------------------------------\n",
+                "\u{27e9}\n",
+                "--------------------------------------------------------------------------------\n",
+                "  echo \u{b7} /tmp/agents/muse-echo-captures-c7025c1179c99bb4/workspace\n",
+            ),
+        ),
+        (
+            "running-third-diamond-80",
+            AgentState::Working,
+            concat!(
+                "  Including your Claude Code personal rules and 19 skills \u{2014} manage with\n",
+                "  /settings.\n",
+                "\u{27e9} Local spinner probe\n",
+                "\u{25c8} Thinking (0s \u{b7} esc to interrupt)\n",
+                "--------------------------------------------------------------------------------\n",
+                "\u{27e9}\n",
+                "--------------------------------------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} /t/a/muse-dialog-captures-eda35ac8e55b9f0d/workspace\n",
+            ),
+        ),
+        (
+            "settled-48",
+            AgentState::Idle,
+            concat!(
+                "  Muse Code 1.0.3\n",
+                "\u{27e9} status detection probe\n",
+                "\u{25c6} echo: status detection probe\n",
+                "------------------------------------------------\n",
+                "\u{27e9}\n",
+                "------------------------------------------------\n",
+                "  echo \u{b7} \u{2026}/workspace\n",
+            ),
+        ),
+        (
+            "settled-80",
+            AgentState::Idle,
+            concat!(
+                "  Muse Code 1.0.3\n",
+                "\u{27e9} status detection probe\n",
+                "\u{25c6} echo: status detection probe\n",
+                "--------------------------------------------------------------------------------\n",
+                "\u{27e9}\n",
+                "--------------------------------------------------------------------------------\n",
+                "  echo \u{b7} /tmp/agents/muse-echo-captures-c7025c1179c99bb4/workspace\n",
+            ),
+        ),
+        (
+            "single-48.txt",
+            AgentState::Blocked,
+            concat!(
+                "                          details in notes\n",
+                "                          (tab).\n",
+                "  Enter to select \u{b7} \u{2191}/\u{2193} to move \u{b7} Tab for an\n",
+                "  optional note \u{b7} Esc to interrupt\n",
+                "------------------------------------------------\n",
+                "\u{27e9}\n",
+                "------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} \u{2026}/workspace\n",
+            ),
+        ),
+        (
+            "single-80.txt",
+            AgentState::Blocked,
+            concat!(
+                "  \u{203a} 1. Alpha              First local test choice\n",
+                "    2. Beta               Second local test choice\n",
+                "    3. None of the above  Optionally, add details in notes (tab).\n",
+                "  Enter to select \u{b7} \u{2191}/\u{2193} to move \u{b7} Tab for an optional note \u{b7} Esc to interrupt\n",
+                "--------------------------------------------------------------------------------\n",
+                "\u{27e9}\n",
+                "--------------------------------------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} /t/a/muse-dialog-captures-459c3eb1b710fed1/workspace\n",
+            ),
+        ),
+        (
+            "single-interaction-80.txt",
+            AgentState::Blocked,
+            concat!(
+                "      Note (optional): \u{258c}\n",
+                "    2. Beta               Second local test choice\n",
+                "    3. None of the above  Optionally, add details in notes (tab).\n",
+                "  Enter to select \u{b7} \u{2191}/\u{2193} to move \u{b7} Tab for an optional note \u{b7} Esc to interrupt\n",
+                "--------------------------------------------------------------------------------\n",
+                "\u{27e9}\n",
+                "--------------------------------------------------------------------------------\n",
+                "  muse-spark-1.2 \u{b7} high \u{b7} /t/a/muse-dialog-captures-459c3eb1b710fed1/workspace\n",
+            ),
+        ),
+        (
+            "trust-80",
+            AgentState::Blocked,
+            concat!(
+                "Do you trust this workspace?\n",
+                "Workspace: /tmp/agents/tmux-select-muse-research-bcd48735accbd020/workspace\n",
+                "Trusting allows project-local skills, rules, hooks, and plugin config to load\n",
+                "before the model runs.\n",
+                "Only trust this workspace when you trust its contents.\n",
+                "> 1  Trust and continue\n",
+                "  2  Quit\n",
+                "Use Up/Down or 1/2, then Enter. Esc quits.\n",
+            ),
+        ),
+    ];
+
+    #[test]
+    fn muse_native_captures_match_state() {
+        for &(name, expected, screen) in MUSE_CAPTURES {
+            assert_eq!(match_state(AgentKind::Muse, screen), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn muse_names_and_paths_follow_the_launcher_release_format() {
+        for name in ["muse", "muse-bin-1.0.3-R2198.1", "muse-bin-1.2.34-R5678"] {
+            assert_eq!(AgentKind::from_name(name), Some(AgentKind::Muse));
+            for directory in ["/home/me/.local/bin", "/Users/me/.local/bin"] {
+                assert_eq!(
+                    AgentKind::from_path(&format!("{directory}/{name}")),
+                    Some(AgentKind::Muse)
+                );
+            }
+        }
+        assert_eq!(AgentKind::Muse.label(), "muse");
+    }
+
+    #[test]
+    fn muse_rejects_truncated_and_malformed_executable_names() {
+        for name in [
+            "muse-bin-1.0.3-",
+            "muse-bin-1.0.3-R",
+            "muse-bin-1.0.3-R2198.",
+            "muse-bin-1.0.3-R2198.1.2",
+            "muse-bin-1.0.3-R2198.1-backup",
+            "muse-bin-1.0.3-Rx",
+            "muse-bin-1.0-R2198",
+            "muse-bin-1.0.3.4-R2198",
+            "muse-bin-1..3-R2198",
+            "muse-bin-a.0.3-R2198",
+            "muse-code",
+        ] {
+            assert_eq!(AgentKind::from_name(name), None, "{name}");
+            assert_eq!(AgentKind::from_path(&format!("/opt/bin/{name}")), None);
+        }
+        assert_eq!(AgentKind::from_path("/opt/muse/versions/1.0.3"), None);
+        assert_eq!(AgentKind::from_path("/opt/muse/bin/node"), None);
+    }
+
+    #[test]
+    fn muse_approval_selection_does_not_change_state() {
+        for &(name, expected, screen) in MUSE_CAPTURES {
+            if expected != AgentState::Blocked
+                || !(name.starts_with("approval") || name.starts_with("escalation"))
+            {
+                continue;
+            }
+            let unselected = screen.replace('\u{203a}', " ");
+            for selected in 1..=3 {
+                let selected_screen = unselected.replacen(
+                    &format!("  {selected}. "),
+                    &format!("\u{203a} {selected}. "),
+                    1,
+                );
+                assert_eq!(
+                    match_state(AgentKind::Muse, &selected_screen),
+                    expected,
+                    "{name}, selection {selected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn muse_approval_requires_paired_numbered_options_in_order() {
+        for screen in [
+            "1. Yes, proceed (y)",
+            "2. No, and tell Muse Code what to do differently (esc)",
+            "1. Allow this stage once (y)",
+            "3. Abort the entire command (esc)",
+            "Yes, proceed (y)\nNo, and tell Muse Code what to do differently (esc)",
+            "1. No, and tell Muse Code what to do differently (esc)\n2. Yes, proceed (y)",
+            "1. Abort the entire command (esc)\n2. Allow this stage once (y)",
+            "x. Yes, proceed (y)\n2. No, and tell Muse Code what to do differently (esc)",
+            "1. Yes, proceed (y) later\n2. No, and tell Muse Code what to do differently (esc)",
+        ] {
+            assert_eq!(
+                match_state(AgentKind::Muse, screen),
+                AgentState::Idle,
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn muse_incomplete_hints_and_completed_diamonds_are_idle() {
+        for screen in [
+            "\u{25c6} Local probe complete.",
+            "\u{25c7} Thinking",
+            "Thinking (0s \u{b7} esc to interrupt)",
+            "\u{25c6} esc to interrupt)",
+            "Enter to select \u{b7} Esc to interrupt",
+            "Tab for an optional note \u{b7} Esc to interrupt",
+            "Enter to select \u{b7} Tab for an optional note",
+            "Select model\nPress enter to confirm or esc to go back",
+            "",
+        ] {
+            assert_eq!(
+                match_state(AgentKind::Muse, screen),
+                AgentState::Idle,
+                "{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn muse_blocked_options_win_over_working() {
+        let screen = concat!(
+            "\u{25c6} Calling tools (0s \u{b7} esc to interrupt)\n",
+            "\u{203a} 1. Yes, proceed (y)\n",
+            "  2. No, and tell Muse Code what to do differently (esc)\n",
+        );
+        assert_eq!(match_state(AgentKind::Muse, screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn muse_history_outside_the_live_region_is_idle() {
+        for &(name, _, screen) in MUSE_CAPTURES {
+            let screen = format!("{screen}{}", "transcript line\n\n".repeat(LIVE_LINES));
+            assert_eq!(
+                match_state(AgentKind::Muse, &screen),
+                AgentState::Idle,
+                "{name}"
+            );
+        }
+        let options =
+            "1. Yes, proceed (y)\n2. No, and tell Muse Code what to do differently (esc)\n";
+        for (padding, expected) in [(6, AgentState::Blocked), (7, AgentState::Idle)] {
+            let screen = format!("{options}{}", "transcript line\n".repeat(padding));
+            assert_eq!(match_state(AgentKind::Muse, &screen), expected);
+        }
+    }
 
     fn claude_frame(body: &str) -> String {
         format!("{body}\n────────────\n❯ \n────────────\n  ~/projects/x  claude\n")
