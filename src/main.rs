@@ -4,6 +4,7 @@ mod process;
 mod tmux;
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::process::ExitCode;
 
 use agent::{AgentKind, AgentState, match_state};
@@ -20,31 +21,75 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
+    if let Some(name) = rename_argument(std::env::args_os().skip(1))? {
+        let tmux =
+            std::env::var("TMUX").map_err(|_| "TMUX is not set; rename must run inside tmux")?;
+        let pane_id = std::env::var("TMUX_PANE")
+            .map_err(|_| "TMUX_PANE is not set; cannot identify the calling pane")?;
+        return tmux::rename_window(&tmux, &pane_id, &name);
+    }
+
     let session = tmux::current_session_id()?;
     let mut client = ControlClient::attach(&session)?;
     let panes = client.enumerate(&session)?;
     let pane_pids: HashSet<u32> = panes.iter().map(|pane| pane.pane_pid).collect();
-    let windows = group_windows(panes);
+    let mut windows = group_windows(panes);
     let default_index = windows.iter().position(|window| window.active).unwrap_or(0);
     let agents = process::classify_panes(&pane_pids);
 
-    let mut candidates = Vec::with_capacity(windows.len());
-    for window in &windows {
-        candidates.push(build_entry(&mut client, window, &agents)?);
-    }
+    let readings = windows
+        .iter()
+        .map(|window| read_agents(&mut client, window, &agents))
+        .collect::<Vec<_>>();
+    let candidates = windows
+        .iter()
+        .zip(&readings)
+        .map(|(window, readings)| candidate_for(window, readings))
+        .collect();
     client.detach()?;
 
-    if let Some(target) = picker::pick(candidates, default_index)? {
+    let tmux = std::env::var("TMUX")?;
+    if let Some(target) = picker::pick(candidates, default_index, |index, name| {
+        let window = windows.get_mut(index).ok_or("selected window is missing")?;
+        let readings = readings
+            .get(index)
+            .ok_or("selected window readings are missing")?;
+        window.name = tmux::rename_selected_window(&tmux, &window.window_id, name)?;
+        window.label.clone_from(&window.name);
+        Ok(candidate_for(window, readings))
+    })? {
         tmux::switch_to(&target.window_id, target.pane_id.as_deref())?;
     }
     Ok(())
+}
+
+fn rename_argument(mut args: impl Iterator<Item = OsString>) -> Result<Option<String>> {
+    let Some(command) = args.next() else {
+        return Ok(None);
+    };
+    if command != "rename" {
+        return Err("usage: tmux-select [rename <name>]".into());
+    }
+    let name = args
+        .next()
+        .ok_or("usage: tmux-select rename <name>")?
+        .into_string()
+        .map_err(|_| "window name must be valid UTF-8")?;
+    if args.next().is_some() {
+        return Err("usage: tmux-select rename <name> (quote names containing spaces)".into());
+    }
+    if name.trim().is_empty() || name.contains('\0') {
+        return Err("window name must be nonempty and contain no NUL bytes".into());
+    }
+    Ok(Some(name))
 }
 
 struct Window {
     window_id: String,
     window_index: u32,
     active: bool,
-    path: String,
+    name: String,
+    label: String,
     panes: Vec<Pane>,
 }
 
@@ -64,12 +109,13 @@ fn group_windows(panes: Vec<Pane>) -> Vec<Window> {
                 window_id: pane.window_id.clone(),
                 window_index: pane.window_index,
                 active: pane.window_active,
-                path: String::new(),
+                name: pane.window_name.clone(),
+                label: String::new(),
                 panes: Vec::new(),
             }
         });
-        if pane.pane_active || window.path.is_empty() {
-            window.path = pane.current_path.clone();
+        if pane.pane_active || window.label.is_empty() {
+            window.label = pane.label.clone();
         }
         window.panes.push(pane);
     }
@@ -81,11 +127,11 @@ fn group_windows(panes: Vec<Pane>) -> Vec<Window> {
     grouped
 }
 
-fn build_entry(
+fn read_agents(
     client: &mut ControlClient,
     window: &Window,
     agents: &HashMap<u32, AgentKind>,
-) -> Result<picker::Candidate> {
+) -> Vec<AgentReading> {
     let mut agent_panes: Vec<(&Pane, AgentKind)> = window
         .panes
         .iter()
@@ -108,7 +154,7 @@ fn build_entry(
             state,
         });
     }
-    Ok(candidate_for(window, &readings))
+    readings
 }
 
 fn pane_agent(pane: &Pane, agents: &HashMap<u32, AgentKind>) -> Option<AgentKind> {
@@ -127,8 +173,8 @@ fn state_color(state: AgentState) -> picker::SpanColor {
 }
 
 fn candidate_for(window: &Window, readings: &[AgentReading]) -> picker::Candidate {
-    let path = window.path.replace(['\t', '\n', '\r'], " ");
-    let mut display = format!("{:>2}: {}", window.window_index, path);
+    let label = window.label.replace(['\t', '\n', '\r'], " ");
+    let mut display = format!("{:>2}: {}", window.window_index, label);
     let mut length = display.chars().count();
     let mut spans = Vec::with_capacity(readings.len());
     let mut blocked: Option<String> = None;
@@ -150,6 +196,7 @@ fn candidate_for(window: &Window, readings: &[AgentReading]) -> picker::Candidat
     }
     picker::Candidate {
         display,
+        name: window.name.clone(),
         spans,
         window_id: window.window_id.clone(),
         pane_id: blocked,
@@ -160,12 +207,49 @@ fn candidate_for(window: &Window, readings: &[AgentReading]) -> picker::Candidat
 mod tests {
     use super::*;
 
+    #[test]
+    fn no_arguments_open_the_picker() {
+        assert_eq!(rename_argument(std::iter::empty()).unwrap(), None);
+    }
+
+    #[test]
+    fn rename_accepts_one_literal_name() {
+        for name in [
+            "ISSUE-123",
+            "ISSUE-123 fix login",
+            "-leading",
+            "  padded  ",
+            ";",
+        ] {
+            let args = [OsString::from("rename"), OsString::from(name)];
+            assert_eq!(
+                rename_argument(args.into_iter()).unwrap(),
+                Some(name.into())
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_arguments_fail_before_opening_the_picker() {
+        for args in [
+            vec!["unknown"],
+            vec!["rename"],
+            vec!["rename", ""],
+            vec!["rename", " \t"],
+            vec!["rename", "bad\0name"],
+            vec!["rename", "ISSUE-123", "extra"],
+        ] {
+            assert!(rename_argument(args.into_iter().map(OsString::from)).is_err());
+        }
+    }
+
     fn window() -> Window {
         Window {
             window_id: "@3".to_string(),
             window_index: 12,
             active: false,
-            path: "~/api".to_string(),
+            name: "api".into(),
+            label: "~/api".to_string(),
             panes: Vec::new(),
         }
     }
@@ -213,7 +297,7 @@ mod tests {
     #[test]
     fn spans_use_char_indexes_for_a_non_ascii_path() {
         let mut window = window();
-        window.path = "~/посткод".to_string();
+        window.label = "~/посткод".to_string();
         let readings = [reading("%1", "claude", AgentState::Idle)];
         let candidate = candidate_for(&window, &readings);
         let chars: Vec<char> = candidate.display.chars().collect();
@@ -235,7 +319,8 @@ mod tests {
                 pane_index: 1,
                 pane_pid: 5,
                 current_command: "bash".into(),
-                current_path: "/a".into(),
+                window_name: "shell".into(),
+                label: "/a".into(),
             },
             Pane {
                 pane_id: "%9".into(),
@@ -246,7 +331,8 @@ mod tests {
                 pane_index: 2,
                 pane_pid: 9,
                 current_command: "vim".into(),
-                current_path: "/active".into(),
+                window_name: "shell".into(),
+                label: "/active".into(),
             },
             Pane {
                 pane_id: "%2".into(),
@@ -257,15 +343,41 @@ mod tests {
                 pane_index: 1,
                 pane_pid: 2,
                 current_command: "claude".into(),
-                current_path: "/work".into(),
+                window_name: "Fix allocation leak".into(),
+                label: "Fix allocation leak".into(),
             },
         ];
         let windows = group_windows(panes);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].window_index, 1);
         assert!(windows[0].active);
+        assert_eq!(
+            candidate_for(&windows[0], &[]).display,
+            " 1: Fix allocation leak"
+        );
         assert_eq!(windows[1].window_index, 2);
         assert!(!windows[1].active);
-        assert_eq!(windows[1].path, "/active");
+        assert_eq!(windows[1].label, "/active");
+    }
+
+    #[test]
+    fn fixed_window_names_preserve_agent_spans_and_blocked_targets() {
+        let mut window = window();
+        window.label = "Fix\tallocation\nleak\r\u{e9}".into();
+        let candidate = candidate_for(&window, &[reading("%4", "claude", AgentState::Blocked)]);
+        assert_eq!(
+            candidate.display,
+            "12: Fix allocation leak \u{e9} [claude: blocked]"
+        );
+        assert_eq!(candidate.pane_id.as_deref(), Some("%4"));
+        let (range, color) = &candidate.spans[0];
+        let state: String = candidate
+            .display
+            .chars()
+            .skip(range.start)
+            .take(range.len())
+            .collect();
+        assert_eq!(state, "blocked");
+        assert_eq!(*color, picker::SpanColor::Red);
     }
 }

@@ -19,6 +19,7 @@ pub enum SpanColor {
 
 pub struct Candidate {
     pub display: String,
+    pub name: String,
     pub spans: Vec<(Range<usize>, SpanColor)>,
     pub window_id: String,
     pub pane_id: Option<String>,
@@ -29,7 +30,11 @@ pub struct Target {
     pub pane_id: Option<String>,
 }
 
-pub fn pick(candidates: Vec<Candidate>, default_index: usize) -> Result<Option<Target>> {
+pub fn pick(
+    mut candidates: Vec<Candidate>,
+    default_index: usize,
+    rename: impl FnMut(usize, &str) -> Result<Candidate>,
+) -> Result<Option<Target>> {
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -37,18 +42,25 @@ pub fn pick(candidates: Vec<Candidate>, default_index: usize) -> Result<Option<T
         .into_raw_mode()
         .map_err(|error| format!("failed to enter terminal raw mode (not a tty?): {error}"))?;
     let mut screen = raw.into_alternate_screen()?;
-    run(&candidates, &mut screen, default_index)
+    run(
+        &mut candidates,
+        &mut screen,
+        default_index,
+        io::stdin().keys(),
+        rename,
+    )
 }
 
 fn run<W: Write>(
-    candidates: &[Candidate],
+    candidates: &mut [Candidate],
     screen: &mut W,
     default_index: usize,
+    mut keys: impl Iterator<Item = io::Result<Key>>,
+    mut rename: impl FnMut(usize, &str) -> Result<Candidate>,
 ) -> Result<Option<Target>> {
     let mut query = String::new();
     let mut filtered = rank(candidates, &query);
-    let mut selected = default_index;
-    let mut keys = io::stdin().keys();
+    let mut selected = default_index.min(filtered.len().saturating_sub(1));
 
     loop {
         render(screen, candidates, &filtered, &query, selected)?;
@@ -63,6 +75,25 @@ fn run<W: Write>(
                 }));
             }
             Key::Esc | Key::Ctrl('c') | Key::Ctrl('g') => return Ok(None),
+            Key::Ctrl('r') => {
+                if let Some(&index) = filtered.get(selected) {
+                    let candidate = candidates
+                        .get_mut(index)
+                        .ok_or("selected window is missing")?;
+                    if let Some(replacement) =
+                        edit_name(screen, &mut keys, &candidate.name, |name| {
+                            rename(index, name)
+                        })?
+                    {
+                        *candidate = replacement;
+                        filtered = rank(candidates, &query);
+                        selected = filtered
+                            .iter()
+                            .position(|&item| item == index)
+                            .unwrap_or_else(|| selected.min(filtered.len().saturating_sub(1)));
+                    }
+                }
+            }
             Key::Up | Key::Ctrl('p') => selected = selected.saturating_sub(1),
             Key::Down | Key::Ctrl('n') => {
                 if selected + 1 < filtered.len() {
@@ -89,6 +120,69 @@ fn run<W: Write>(
     }
 }
 
+fn edit_name<W: Write>(
+    screen: &mut W,
+    keys: &mut impl Iterator<Item = io::Result<Key>>,
+    initial_name: &str,
+    mut rename: impl FnMut(&str) -> Result<Candidate>,
+) -> Result<Option<Candidate>> {
+    let mut name = initial_name.replace(r"\\", r"\");
+    let mut error = String::new();
+    loop {
+        render_name(screen, &name, &error)?;
+        let Some(key) = keys.next() else {
+            return Ok(None);
+        };
+        match key? {
+            Key::Char('\n') | Key::Char('\r') => match rename(&name) {
+                Ok(candidate) => return Ok(Some(candidate)),
+                Err(failure) => error = failure.to_string(),
+            },
+            Key::Esc | Key::Ctrl('c') | Key::Ctrl('g') => return Ok(None),
+            Key::Ctrl('u') => {
+                name.clear();
+                error.clear();
+            }
+            Key::Backspace => {
+                name.pop();
+                error.clear();
+            }
+            Key::Char(ch) if !ch.is_control() => {
+                name.push(ch);
+                error.clear();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn render_name<W: Write>(screen: &mut W, name: &str, error: &str) -> Result<()> {
+    let (cols, _) = termion::terminal_size().unwrap_or((80, 24));
+    let width = usize::from(cols.max(9));
+    let tail: String = name
+        .chars()
+        .skip(name.chars().count().saturating_sub(width - 9))
+        .collect();
+    let message: String = error
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(width)
+        .collect();
+    write!(
+        screen,
+        "{}{}Rename> {tail}{}Enter: save | Esc: cancel | Ctrl-U: clear{}{}{message}{}{}",
+        clear::All,
+        cursor::Goto(1, 1),
+        cursor::Goto(1, 2),
+        cursor::Goto(1, 3),
+        color::Fg(color::Red),
+        color::Fg(color::Reset),
+        cursor::Goto((tail.chars().count() + 9) as u16, 1)
+    )?;
+    screen.flush()?;
+    Ok(())
+}
+
 fn render<W: Write>(
     screen: &mut W,
     candidates: &[Candidate],
@@ -109,7 +203,7 @@ fn render<W: Write>(
         color::Fg(color::Cyan),
         color::Fg(color::Reset),
     )?;
-    let info = format!("  {}/{} ", filtered.len(), candidates.len());
+    let info = format!("  {}/{}  Ctrl-R: rename ", filtered.len(), candidates.len());
     let rule = width.saturating_sub(info.chars().count());
     write!(
         screen,
@@ -333,9 +427,159 @@ fn is_subsequence(needle: &[char], hay: &[char]) -> bool {
 mod tests {
     use super::*;
 
+    fn keys(input: &[Key]) -> impl Iterator<Item = io::Result<Key>> + '_ {
+        input.iter().cloned().map(Ok)
+    }
+
+    #[test]
+    fn rename_saves_the_filtered_window_and_preserves_its_pane_target() {
+        let mut candidates = [candidate("notes"), candidate("api")];
+        candidates[1].window_id = "@9".into();
+        candidates[1].pane_id = Some("%5".into());
+        let mut calls = Vec::new();
+        let target = run(
+            &mut candidates,
+            &mut Vec::new(),
+            0,
+            keys(&[
+                Key::Char('a'),
+                Key::Char('p'),
+                Key::Ctrl('r'),
+                Key::Char('2'),
+                Key::Char('\n'),
+                Key::Char('\n'),
+            ]),
+            |index, name| {
+                calls.push((index, name.to_owned()));
+                let mut updated = candidate(name);
+                updated.window_id = "@9".into();
+                updated.pane_id = Some("%5".into());
+                Ok(updated)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(calls, [(1, "api2".into())]);
+        assert_eq!(candidates[1].display, "api2");
+        assert_eq!(target.window_id, "@9");
+        assert_eq!(target.pane_id.as_deref(), Some("%5"));
+    }
+
+    #[test]
+    fn cancelling_rename_preserves_the_filter_and_selected_window() {
+        for cancel in [Key::Esc, Key::Ctrl('c'), Key::Ctrl('g')] {
+            let mut candidates = [candidate("notes"), candidate("api")];
+            candidates[1].window_id = "@9".into();
+            let target = run(
+                &mut candidates,
+                &mut Vec::new(),
+                0,
+                keys(&[
+                    Key::Char('a'),
+                    Key::Ctrl('r'),
+                    Key::Ctrl('u'),
+                    Key::Char('x'),
+                    cancel,
+                    Key::Char('\n'),
+                ]),
+                |_, _| panic!("cancel must not rename"),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(target.window_id, "@9");
+            assert_eq!(candidates[1].name, "api");
+        }
+    }
+
+    #[test]
+    fn failed_rename_stays_in_editor_and_can_be_retried() {
+        let mut candidates = [candidate("api")];
+        let mut calls = Vec::new();
+        let mut screen = Vec::new();
+        run(
+            &mut candidates,
+            &mut screen,
+            0,
+            keys(&[
+                Key::Ctrl('r'),
+                Key::Char('\n'),
+                Key::Ctrl('u'),
+                Key::Char('x'),
+                Key::Char('\n'),
+                Key::Esc,
+            ]),
+            |_, name| {
+                calls.push(name.to_owned());
+                if name == "api" {
+                    return Err("rename denied".into());
+                }
+                Ok(candidate(name))
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, ["api", "x"]);
+        assert_eq!(candidates[0].display, "x");
+        assert!(String::from_utf8(screen).unwrap().contains("rename denied"));
+    }
+
+    #[test]
+    fn renaming_can_remove_a_window_from_the_current_filter() {
+        let mut candidates = [candidate("api"), candidate("notes")];
+        candidates[1].window_id = "@7".into();
+        let target = run(
+            &mut candidates,
+            &mut Vec::new(),
+            0,
+            keys(&[
+                Key::Char('a'),
+                Key::Ctrl('r'),
+                Key::Ctrl('u'),
+                Key::Char('x'),
+                Key::Char('\n'),
+                Key::Ctrl('r'),
+                Key::Ctrl('u'),
+                Key::Down,
+                Key::Char('\n'),
+            ]),
+            |index, name| {
+                assert_eq!(index, 0);
+                assert_eq!(name, "x");
+                Ok(candidate(name))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(target.window_id, "@7");
+    }
+
+    #[test]
+    fn rename_backspace_removes_a_unicode_character_and_eof_cancels() {
+        let mut screen = Vec::new();
+        let renamed = edit_name(
+            &mut screen,
+            &mut keys(&[Key::Backspace, Key::Char('\n')]),
+            "name\u{e9}",
+            |name| {
+                assert_eq!(name, "name");
+                Ok(candidate(name))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(renamed.name, "name");
+        assert!(
+            edit_name(&mut screen, &mut keys(&[]), "name", |_: &str| panic!(
+                "EOF must not rename"
+            ))
+            .unwrap()
+            .is_none()
+        );
+    }
+
     fn candidate(display: &str) -> Candidate {
         Candidate {
             display: display.to_string(),
+            name: display.to_string(),
             spans: Vec::new(),
             window_id: "@0".into(),
             pane_id: None,

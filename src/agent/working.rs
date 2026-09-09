@@ -24,9 +24,7 @@ pub(crate) fn is_working(kind: AgentKind, line: &str) -> bool {
             let head = line.trim_start();
             (head.starts_with(CLAUDE_SPINNER) && head.contains("… (")) || head.starts_with('◯')
         }
-        AgentKind::Codex => {
-            line.contains("to interrupt)") || line.contains("background terminal running")
-        }
+        AgentKind::Codex => line.contains("to interrupt)"),
         AgentKind::Kimi => kimi_is_working(line),
         AgentKind::Pi => pi_is_working(line),
         AgentKind::OpenCode => opencode_is_working(line),
@@ -230,7 +228,6 @@ mod tests {
             "Working (0s • esc to interrupt)",
             "• Thinking (5s • esc to interrupt)",
             "• Reviewing approval request (2s • esc to interrupt)",
-            "1 background terminal running · /ps to view · /stop to close",
         ] {
             let screen = format!("$ cargo build\n{line}\n› \nctrl+t to view transcript\n");
             assert_eq!(
@@ -238,6 +235,27 @@ mod tests {
                 AgentState::Working,
                 "{line}"
             );
+        }
+    }
+
+    #[test]
+    fn codex_background_terminals_do_not_determine_turn_state() {
+        for footer in [
+            "1 background terminal running \u{b7} /ps to view \u{b7} /stop to close",
+            "2 background terminals running \u{b7} /ps to view \u{b7} /stop to close",
+        ] {
+            for (status, expected) in [
+                ("", AgentState::Idle),
+                ("\u{2500} Worked for 1h 06m 28s \u{2500}", AgentState::Idle),
+                ("Working (13s \u{b7} esc to interrupt)", AgentState::Working),
+                (
+                    "Press enter to confirm or esc to cancel",
+                    AgentState::Blocked,
+                ),
+            ] {
+                let screen = format!("{status}\n\n  {footer}\n\u{203a} \n");
+                assert_eq!(match_state(AgentKind::Codex, &screen), expected, "{screen}");
+            }
         }
     }
 

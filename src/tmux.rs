@@ -6,10 +6,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const SENTINEL: &str = "TMUXSELECT_SENTINEL";
-const PANE_FORMAT: &str = "#{pane_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_index}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{s|\\n| |:pane_current_path}";
+const PANE_FORMAT: &str = "#{pane_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_index}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{?automatic-rename,#{s|\\n| |:pane_current_path},#{s|\\n| |:window_name}}\x1f#{s|\\n| |:window_name}";
 // tmux octal-escapes non-printable bytes in control-mode command output.
 const CONTROL_MODE_PANE_SEPARATOR: &str = r"\037";
-const PANE_FIELDS: usize = 9;
+const PANE_FIELDS: usize = 10;
 
 pub struct Pane {
     pub pane_id: String,
@@ -20,7 +20,8 @@ pub struct Pane {
     pub pane_index: u32,
     pub pane_pid: u32,
     pub current_command: String,
-    pub current_path: String,
+    pub label: String,
+    pub window_name: String,
 }
 
 enum Block {
@@ -46,6 +47,86 @@ fn session_id_from_tmux_value(tmux: &str) -> Result<String> {
         .filter(|field| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit()))
         .ok_or("TMUX has an unexpected format; cannot resolve the current session id")?;
     Ok(format!("${number}"))
+}
+
+pub fn rename_window(tmux: &str, pane_id: &str, name: &str) -> Result<()> {
+    let socket = rename_socket(tmux, pane_id)?;
+    run_rename(&mut rename_command(socket, pane_id, name)).map(|_| ())
+}
+
+pub fn rename_selected_window(tmux: &str, window_id: &str, name: &str) -> Result<String> {
+    if !window_id.strip_prefix('@').is_some_and(is_decimal) {
+        return Err("selected window must have an ID such as @0".into());
+    }
+    if name.trim().is_empty() || name.contains('\0') {
+        return Err("window name must be nonempty and contain no NUL bytes".into());
+    }
+    let socket = socket_from_tmux_value(tmux)?;
+    let mut command = rename_command(socket, window_id, name);
+    command.args([
+        ";",
+        "display-message",
+        "-p",
+        "-t",
+        window_id,
+        "#{window_name}",
+    ]);
+    run_rename(&mut command)
+}
+
+fn rename_command(socket: &str, target: &str, name: &str) -> Command {
+    let mut command = Command::new("tmux");
+    command
+        .args(["-S", socket, "rename-window", "-t", target, "--"])
+        .arg(literal_window_name(name));
+    command
+}
+
+fn run_rename(command: &mut Command) -> Result<String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to start tmux: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("failed to rename the window: {}", detail.trim()).into());
+    }
+    let name = String::from_utf8(output.stdout)?;
+    Ok(name.trim_end_matches('\n').to_owned())
+}
+
+fn rename_socket<'a>(tmux: &'a str, pane_id: &str) -> Result<&'a str> {
+    if !pane_id.strip_prefix('%').is_some_and(is_decimal) {
+        return Err("TMUX_PANE must be a pane ID such as %0".into());
+    }
+    socket_from_tmux_value(tmux)
+}
+
+fn socket_from_tmux_value(tmux: &str) -> Result<&str> {
+    let mut fields = tmux.rsplitn(3, ',');
+    let session = fields.next();
+    let pid = fields.next();
+    let socket = fields.next();
+    match (session, pid, socket) {
+        (Some(session), Some(pid), Some(socket))
+            if is_decimal(session) && is_decimal(pid) && !socket.is_empty() =>
+        {
+            Ok(socket)
+        }
+        _ => Err("TMUX has an unexpected format; cannot resolve the calling server".into()),
+    }
+}
+
+fn is_decimal(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn literal_window_name(name: &str) -> String {
+    // rename-window expands formats, and tmux's argv parser splits at a final semicolon.
+    let mut escaped = name.replace('#', "##");
+    if escaped.ends_with(';') {
+        escaped.insert(escaped.len() - 1, '\\');
+    }
+    escaped
 }
 
 impl ControlClient {
@@ -204,7 +285,8 @@ fn parse_pane(line: &str) -> Result<Pane> {
         pane_index: fields[5].parse()?,
         pane_pid: fields[6].parse()?,
         current_command: fields[7].to_string(),
-        current_path: fields[8].to_string(),
+        label: fields[8].to_string(),
+        window_name: fields[9].to_string(),
     })
 }
 
@@ -224,6 +306,32 @@ pub fn switch_to(window_id: &str, pane_id: Option<&str>) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn rename_context_uses_the_calling_server_even_with_commas_in_its_path() {
+        assert_eq!(
+            rename_socket("/tmp/agents/a,b/socket,123,4", "%12").unwrap(),
+            "/tmp/agents/a,b/socket"
+        );
+    }
+
+    #[test]
+    fn rename_context_rejects_ambiguous_targets_and_malformed_servers() {
+        for pane in ["", "%", "0", "@0", "name", "%1;", "%1:0", "% 1"] {
+            assert!(rename_socket("/tmp/agents/socket,123,0", pane).is_err());
+        }
+        for tmux in [
+            "",
+            "0",
+            "socket,0",
+            ",123,0",
+            "socket,,0",
+            "socket,abc,0",
+            "socket,123,x",
+        ] {
+            assert!(rename_socket(tmux, "%0").is_err());
+        }
+    }
 
     fn body(block: Block) -> String {
         match block {
@@ -255,19 +363,31 @@ mod tests {
     }
 
     #[test]
-    fn list_panes_command_replaces_newlines_before_line_parsing() {
+    fn list_panes_command_selects_labels_and_replaces_newlines_before_line_parsing() {
         assert!(PANE_FORMAT.contains(r"#{s|\n| |:pane_current_path}"));
+        assert!(PANE_FORMAT.contains(r"#{s|\n| |:window_name}"));
         assert_eq!(
             list_panes_command("$0"),
-            "list-panes -s -t '$0' -F \"#{pane_id}\u{1f}#{window_id}\u{1f}#{window_index}\u{1f}#{window_active}\u{1f}#{pane_active}\u{1f}#{pane_index}\u{1f}#{pane_pid}\u{1f}#{pane_current_command}\u{1f}#{s|\\n| |:pane_current_path}\""
+            "list-panes -s -t '$0' -F \"#{pane_id}\u{1f}#{window_id}\u{1f}#{window_index}\u{1f}#{window_active}\u{1f}#{pane_active}\u{1f}#{pane_index}\u{1f}#{pane_pid}\u{1f}#{pane_current_command}\u{1f}#{?automatic-rename,#{s|\\n| |:pane_current_path},#{s|\\n| |:window_name}}\u{1f}#{s|\\n| |:window_name}\""
         );
     }
 
     #[test]
     fn parses_a_pane_line_after_newline_path_sanitization() {
         let pane =
-            parse_pane(r"%2\037@0\03712\0371\0371\0373\0372776867\037npm\037/tmp/a b").unwrap();
-        assert_eq!(pane.current_path, "/tmp/a b");
+            parse_pane(r"%2\037@0\03712\0371\0371\0373\0372776867\037npm\037/tmp/a b\037shell")
+                .unwrap();
+        assert_eq!(pane.label, "/tmp/a b");
+        assert_eq!(pane.window_name, "shell");
+    }
+
+    #[test]
+    fn parses_a_fixed_window_name_as_the_label() {
+        let pane = parse_pane(
+            r"%2\037@0\03712\0371\0371\0373\0372776867\037npm\037Fix issue #123 | allocator\037Fix issue #123 | allocator",
+        )
+        .unwrap();
+        assert_eq!(pane.label, "Fix issue #123 | allocator");
     }
 
     #[test]
@@ -316,7 +436,8 @@ TMUXSELECT_SENTINEL
     #[test]
     fn parses_a_pane_line_with_a_pipe_in_the_path() {
         let pane =
-            parse_pane(r"%2\037@0\03712\0371\0371\0373\0372776867\037npm\037/home/me/a|b").unwrap();
+            parse_pane(r"%2\037@0\03712\0371\0371\0373\0372776867\037npm\037/home/me/a|b\037shell")
+                .unwrap();
         assert_eq!(pane.pane_id, "%2");
         assert_eq!(pane.window_id, "@0");
         assert_eq!(pane.window_index, 12);
@@ -325,16 +446,17 @@ TMUXSELECT_SENTINEL
         assert_eq!(pane.pane_index, 3);
         assert_eq!(pane.pane_pid, 2776867);
         assert_eq!(pane.current_command, "npm");
-        assert_eq!(pane.current_path, "/home/me/a|b");
+        assert_eq!(pane.label, "/home/me/a|b");
     }
 
     #[test]
     fn parses_a_pane_line_with_a_pipe_in_the_command() {
         let pane =
-            parse_pane(r"%2\037@0\03712\0370\0371\0373\0372776867\037we|ird\037/tmp/x").unwrap();
+            parse_pane(r"%2\037@0\03712\0370\0371\0373\0372776867\037we|ird\037/tmp/x\037shell")
+                .unwrap();
         assert!(!pane.window_active);
         assert_eq!(pane.current_command, "we|ird");
-        assert_eq!(pane.current_path, "/tmp/x");
+        assert_eq!(pane.label, "/tmp/x");
     }
 
     #[test]
