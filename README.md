@@ -2,14 +2,14 @@
 
 An agent-aware tmux window picker. It replaces the usual
 `list-windows | fzf | select-window` binding with a picker that annotates each
-window with the live state of any AI coding agents (Claude Code, Codex, Kimi
+window with the detected state of any AI coding agents (Claude Code, Codex, Kimi
 Code, Pi, OpenCode, Qwen Code, Grok Build, and Muse Code) running in its panes,
 so you can see at a glance which window needs your attention and jump straight
 to the pane that is blocked.
 
 https://github.com/user-attachments/assets/74f50ead-c774-462d-a619-862d38bb2888
 
-It lists the windows of the **current tmux session**, ordered by window index.
+It lists the windows of the **current tmux session**, initially in window-index order.
 Pick one and it switches to it; if a pane there is blocked, it focuses the
 first blocked pane so you land exactly where input is needed.
 
@@ -57,6 +57,8 @@ The picker opens with every window of the current session listed and the active
 window preselected. Type to fuzzy-filter, move with the arrow keys, press Enter
 to switch.
 
+### Window names and renaming
+
 Windows with `automatic-rename` off show their window name instead of the active
 pane's directory. Renaming a window in tmux turns this option off for that window,
 so its assigned name appears and is searchable the next time the picker opens.
@@ -70,6 +72,8 @@ returns to the picker with the updated name and existing agent annotations.
 Esc, `Ctrl-C`, or `Ctrl-G` cancels the edit. Errors stay in the rename prompt.
 The filter is preserved, so a renamed window disappears if it no longer matches.
 Saving uses one tmux subprocess and does not switch windows.
+Both rename methods change the tmux window name, not a pane title. Names are
+passed literally to tmux, including `#`, semicolons, and backslashes.
 
 ### Rename from an agent
 
@@ -85,8 +89,9 @@ state and uses a single tmux command.
 
 An agent instruction can say: `Before starting a task, run tmux-select rename
 "<task ID> <short description>".` The agent's command runner must preserve both
-environment variables. A missing or invalid context, an empty name, or a failed
-tmux command produces an error and a nonzero exit status.
+environment variables. Pass the name as one quoted argument. A missing or invalid
+context, an empty or whitespace-only name, or a failed tmux command produces an
+error and a nonzero exit status.
 
 ### Keys
 
@@ -103,25 +108,35 @@ tmux command produces an error and a nonzero exit status.
 
 ### Agent states
 
-Each agent pane in a window is annotated as `[<agent>: <state>]`:
+Each agent pane in a window is annotated as `[<agent>: <state>]`. States are
+inferred from terminal output captured when the picker opens; reopen it to
+refresh them. Renaming updates the window label but keeps the captured states.
 
 - `blocked` - the agent is paused on a prompt or approval and needs input.
   Selecting the window jumps to that pane.
-- `working` - the agent is actively running.
-- `idle` - the agent is at its prompt with nothing in progress.
+- `working` - an active-turn or supported waiting indicator is detected.
+- `idle` - no recognized working or blocked indicator is detected.
+
+Input requests take precedence over working indicators. A Codex background
+terminal footer alone does not count as working: a completed turn remains idle
+even if a background terminal is still running.
 
 ### Filtering by state
 
-The fuzzy filter matches against the whole line, including the annotations, so
-typing `blocked` narrows the list to exactly the windows needing input. This is
-the fastest way to find what needs attention, since windows stay in index order
-rather than sorting blocked ones to the top.
+The fuzzy filter matches the whole line: window index, name or directory, and
+agent annotations. Type `blocked` to find windows needing input; names and paths
+can also match, so this is not an exclusive state filter.
+
+An empty filter keeps window-index order. With a query, matches are ranked by
+fuzzy score, then earliest match position, with window-index order breaking ties.
 
 ## Tests
 
 Run `cargo test --locked`. To also run the live rename tests, install tmux and use
 `cargo test --locked -- --include-ignored`. These tests create isolated servers
 under `/tmp/agents` and remove them afterward.
+They cover caller-window targeting, Ctrl-R editing and errors, and literal names,
+including repeated edits of names containing backslashes.
 
 ## License
 
