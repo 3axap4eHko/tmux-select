@@ -1,6 +1,6 @@
-use std::env;
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -35,12 +35,7 @@ pub struct ControlClient {
     reader: BufReader<ChildStdout>,
 }
 
-pub fn current_session_id() -> Result<String> {
-    let tmux = env::var("TMUX").map_err(|_| "TMUX is not set; tmux-select must run inside tmux")?;
-    session_id_from_tmux_value(&tmux)
-}
-
-fn session_id_from_tmux_value(tmux: &str) -> Result<String> {
+pub fn session_id_from_tmux_value(tmux: &str) -> Result<String> {
     let number = tmux
         .rsplit(',')
         .next()
@@ -101,14 +96,16 @@ fn rename_socket<'a>(tmux: &'a str, pane_id: &str) -> Result<&'a str> {
     socket_from_tmux_value(tmux)
 }
 
-fn socket_from_tmux_value(tmux: &str) -> Result<&str> {
+pub fn socket_from_tmux_value(tmux: &str) -> Result<&str> {
     let mut fields = tmux.rsplitn(3, ',');
     let session = fields.next();
     let pid = fields.next();
     let socket = fields.next();
     match (session, pid, socket) {
         (Some(session), Some(pid), Some(socket))
-            if is_decimal(session) && is_decimal(pid) && !socket.is_empty() =>
+            if (is_decimal(session) || session == "-1")
+                && is_decimal(pid)
+                && !socket.is_empty() =>
         {
             Ok(socket)
         }
@@ -130,8 +127,13 @@ fn literal_window_name(name: &str) -> String {
 }
 
 impl ControlClient {
-    pub fn attach(session_id: &str) -> Result<Self> {
+    pub fn attach(socket: &Path, session_id: &str) -> Result<Self> {
+        if !session_id.strip_prefix('$').is_some_and(is_decimal) {
+            return Err("session target must be an ID such as $0".into());
+        }
         let mut child = Command::new("tmux")
+            .arg("-S")
+            .arg(socket)
             .args([
                 "-C",
                 "attach-session",
@@ -158,7 +160,12 @@ impl ControlClient {
             stdin: Some(stdin),
             reader: BufReader::new(stdout),
         };
-        client.synchronize()?;
+        if let Err(error) = client.synchronize() {
+            if let Err(detach_error) = client.detach() {
+                return Err(format!("{error}; failed to detach: {detach_error}").into());
+            }
+            return Err(error);
+        }
         Ok(client)
     }
 
@@ -206,10 +213,18 @@ impl ControlClient {
     pub fn detach(mut self) -> Result<()> {
         drop(self.stdin.take());
         let mut sink = String::new();
-        while self.reader.read_line(&mut sink)? != 0 {
-            sink.clear();
+        let drained = loop {
+            match self.reader.read_line(&mut sink) {
+                Ok(0) => break Ok(()),
+                Ok(_) => sink.clear(),
+                Err(error) => break Err(error),
+            }
+        };
+        let waited = self.child.wait();
+        drained?;
+        if !waited?.success() {
+            return Err("the tmux control client exited unsuccessfully".into());
         }
-        self.child.wait()?;
         Ok(())
     }
 }
@@ -290,8 +305,9 @@ fn parse_pane(line: &str) -> Result<Pane> {
     })
 }
 
-pub fn switch_to(window_id: &str, pane_id: Option<&str>) -> Result<()> {
+pub fn switch_to(socket: &Path, window_id: &str, pane_id: Option<&str>) -> Result<()> {
     let mut command = Command::new("tmux");
+    command.arg("-S").arg(socket);
     command.args(["select-window", "-t", window_id]);
     if let Some(pane) = pane_id {
         command.arg(";").args(["select-pane", "-t", pane]);
@@ -313,6 +329,18 @@ mod tests {
             rename_socket("/tmp/agents/a,b/socket,123,4", "%12").unwrap(),
             "/tmp/agents/a,b/socket"
         );
+    }
+
+    #[test]
+    fn job_socket_is_independent_of_a_session_id() {
+        assert_eq!(
+            socket_from_tmux_value("/tmp/agents/a,b/socket,123,-1").unwrap(),
+            "/tmp/agents/a,b/socket"
+        );
+        for value in ["socket,123,-2", "socket,123,", "socket,,0", ",123,-1"] {
+            assert!(socket_from_tmux_value(value).is_err());
+        }
+        assert!(session_id_from_tmux_value("socket,123,-1").is_err());
     }
 
     #[test]

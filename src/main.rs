@@ -1,14 +1,18 @@
 mod agent;
+mod collect;
 mod picker;
 mod process;
 mod tmux;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 
-use agent::{AgentKind, AgentState, match_state};
-use tmux::{ControlClient, Pane, Result};
+use agent::AgentState;
+use collect::{PaneReading, collect_panes};
+use tmux::Result;
 
 fn main() -> ExitCode {
     match run() {
@@ -21,54 +25,96 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    if let Some(name) = rename_argument(std::env::args_os().skip(1))? {
-        let tmux =
-            std::env::var("TMUX").map_err(|_| "TMUX is not set; rename must run inside tmux")?;
-        let pane_id = std::env::var("TMUX_PANE")
-            .map_err(|_| "TMUX_PANE is not set; cannot identify the calling pane")?;
-        return tmux::rename_window(&tmux, &pane_id, &name);
+    let command = parse_arguments(std::env::args_os().skip(1))?;
+    let tmux =
+        std::env::var("TMUX").map_err(|_| "TMUX is not set; tmux-select must run inside tmux")?;
+    match command {
+        CliCommand::Status(target) => {
+            let session = status_session(&tmux, target.as_deref())?;
+            let panes = collect_panes(Path::new(tmux::socket_from_tmux_value(&tmux)?), &session)?;
+            let status = status_line(
+                panes
+                    .iter()
+                    .filter_map(|reading| reading.agent.map(|(_, state)| state)),
+            );
+            writeln!(std::io::stdout().lock(), "{status}")?;
+            Ok(())
+        }
+        CliCommand::Pick => {
+            let session = tmux::session_id_from_tmux_value(&tmux)?;
+            let panes = collect_panes(Path::new(tmux::socket_from_tmux_value(&tmux)?), &session)?;
+            show_picker(&tmux, panes)
+        }
+        CliCommand::Rename(name) => {
+            let pane_id = std::env::var("TMUX_PANE")
+                .map_err(|_| "TMUX_PANE is not set; cannot identify the calling pane")?;
+            tmux::rename_window(&tmux, &pane_id, &name)
+        }
     }
+}
 
-    let session = tmux::current_session_id()?;
-    let mut client = ControlClient::attach(&session)?;
-    let panes = client.enumerate(&session)?;
-    let pane_pids: HashSet<u32> = panes.iter().map(|pane| pane.pane_pid).collect();
+fn show_picker(tmux: &str, panes: Vec<PaneReading>) -> Result<()> {
     let mut windows = group_windows(panes);
     let default_index = windows.iter().position(|window| window.active).unwrap_or(0);
-    let agents = process::classify_panes(&pane_pids);
 
-    let readings = windows
-        .iter()
-        .map(|window| read_agents(&mut client, window, &agents))
-        .collect::<Vec<_>>();
+    let readings = windows.iter().map(agent_readings).collect::<Vec<_>>();
     let candidates = windows
         .iter()
         .zip(&readings)
         .map(|(window, readings)| candidate_for(window, readings))
         .collect();
-    client.detach()?;
-
-    let tmux = std::env::var("TMUX")?;
     if let Some(target) = picker::pick(candidates, default_index, |index, name| {
         let window = windows.get_mut(index).ok_or("selected window is missing")?;
         let readings = readings
             .get(index)
             .ok_or("selected window readings are missing")?;
-        window.name = tmux::rename_selected_window(&tmux, &window.window_id, name)?;
+        window.name = tmux::rename_selected_window(tmux, &window.window_id, name)?;
         window.label.clone_from(&window.name);
         Ok(candidate_for(window, readings))
     })? {
-        tmux::switch_to(&target.window_id, target.pane_id.as_deref())?;
+        tmux::switch_to(
+            Path::new(tmux::socket_from_tmux_value(tmux)?),
+            &target.window_id,
+            target.pane_id.as_deref(),
+        )?;
     }
     Ok(())
 }
 
-fn rename_argument(mut args: impl Iterator<Item = OsString>) -> Result<Option<String>> {
+#[derive(Debug, PartialEq, Eq)]
+enum CliCommand {
+    Pick,
+    Rename(String),
+    Status(Option<String>),
+}
+
+fn parse_arguments(mut args: impl Iterator<Item = OsString>) -> Result<CliCommand> {
     let Some(command) = args.next() else {
-        return Ok(None);
+        return Ok(CliCommand::Pick);
     };
+    if command == "status" {
+        let Some(option) = args.next() else {
+            return Ok(CliCommand::Status(None));
+        };
+        if option != "-t" {
+            return Err("usage: tmux-select status [-t <session-id>]".into());
+        }
+        let session = args
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .ok_or("usage: tmux-select status [-t <session-id>]")?;
+        if args.next().is_some() {
+            return Err("usage: tmux-select status [-t <session-id>]".into());
+        }
+        if !session.strip_prefix('$').is_some_and(|number| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            return Err("session target must be an ID such as $0".into());
+        }
+        return Ok(CliCommand::Status(Some(session)));
+    }
     if command != "rename" {
-        return Err("usage: tmux-select [rename <name>]".into());
+        return Err("usage: tmux-select [status | rename <name>]".into());
     }
     let name = args
         .next()
@@ -81,7 +127,39 @@ fn rename_argument(mut args: impl Iterator<Item = OsString>) -> Result<Option<St
     if name.trim().is_empty() || name.contains('\0') {
         return Err("window name must be nonempty and contain no NUL bytes".into());
     }
-    Ok(Some(name))
+    Ok(CliCommand::Rename(name))
+}
+
+fn status_session(tmux: &str, target: Option<&str>) -> Result<String> {
+    match target {
+        Some(session) => Ok(session.to_owned()),
+        None => tmux::session_id_from_tmux_value(tmux).map_err(|error| {
+            format!("{error}; status-line jobs require status -t '#{{session_id}}'").into()
+        }),
+    }
+}
+
+fn status_line(states: impl Iterator<Item = AgentState>) -> String {
+    let mut working = 0usize;
+    let mut blocked = 0usize;
+    let mut idle = 0usize;
+    for state in states {
+        match state {
+            AgentState::Working => working += 1,
+            AgentState::Blocked => blocked += 1,
+            AgentState::Idle => idle += 1,
+        }
+    }
+    let mut line = String::new();
+    for (label, count) in [("working", working), ("blocked", blocked), ("idle", idle)] {
+        if count != 0 {
+            if !line.is_empty() {
+                line.push_str(" | ");
+            }
+            line.push_str(&format!("{label}: {count}"));
+        }
+    }
+    line
 }
 
 struct Window {
@@ -90,7 +168,7 @@ struct Window {
     active: bool,
     name: String,
     label: String,
-    panes: Vec<Pane>,
+    panes: Vec<PaneReading>,
 }
 
 struct AgentReading {
@@ -99,10 +177,11 @@ struct AgentReading {
     state: AgentState,
 }
 
-fn group_windows(panes: Vec<Pane>) -> Vec<Window> {
+fn group_windows(panes: Vec<PaneReading>) -> Vec<Window> {
     let mut order: Vec<String> = Vec::new();
     let mut windows: HashMap<String, Window> = HashMap::new();
-    for pane in panes {
+    for reading in panes {
+        let pane = &reading.pane;
         let window = windows.entry(pane.window_id.clone()).or_insert_with(|| {
             order.push(pane.window_id.clone());
             Window {
@@ -117,7 +196,7 @@ fn group_windows(panes: Vec<Pane>) -> Vec<Window> {
         if pane.pane_active || window.label.is_empty() {
             window.label = pane.label.clone();
         }
-        window.panes.push(pane);
+        window.panes.push(reading);
     }
     let mut grouped: Vec<Window> = order
         .into_iter()
@@ -127,27 +206,16 @@ fn group_windows(panes: Vec<Pane>) -> Vec<Window> {
     grouped
 }
 
-fn read_agents(
-    client: &mut ControlClient,
-    window: &Window,
-    agents: &HashMap<u32, AgentKind>,
-) -> Vec<AgentReading> {
-    let mut agent_panes: Vec<(&Pane, AgentKind)> = window
+fn agent_readings(window: &Window) -> Vec<AgentReading> {
+    let mut agent_panes: Vec<_> = window
         .panes
         .iter()
-        .filter_map(|pane| pane_agent(pane, agents).map(|kind| (pane, kind)))
+        .filter_map(|reading| reading.agent.map(|agent| (&reading.pane, agent)))
         .collect();
     agent_panes.sort_by_key(|(pane, _)| pane.pane_index);
 
     let mut readings = Vec::with_capacity(agent_panes.len());
-    for (pane, kind) in agent_panes {
-        let state = match client.capture(&pane.pane_id) {
-            Ok(screen) => match_state(kind, &screen),
-            Err(error) => {
-                eprintln!("tmux-select: capture-pane {} failed: {error}", pane.pane_id);
-                AgentState::Idle
-            }
-        };
+    for (pane, (kind, state)) in agent_panes {
         readings.push(AgentReading {
             pane_id: pane.pane_id.clone(),
             label: kind.label(),
@@ -155,13 +223,6 @@ fn read_agents(
         });
     }
     readings
-}
-
-fn pane_agent(pane: &Pane, agents: &HashMap<u32, AgentKind>) -> Option<AgentKind> {
-    agents
-        .get(&pane.pane_pid)
-        .copied()
-        .or_else(|| AgentKind::from_name(&pane.current_command))
 }
 
 fn state_color(state: AgentState) -> picker::SpanColor {
@@ -206,10 +267,14 @@ fn candidate_for(window: &Window, readings: &[AgentReading]) -> picker::Candidat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tmux::Pane;
 
     #[test]
     fn no_arguments_open_the_picker() {
-        assert_eq!(rename_argument(std::iter::empty()).unwrap(), None);
+        assert_eq!(
+            parse_arguments(std::iter::empty()).unwrap(),
+            CliCommand::Pick
+        );
     }
 
     #[test]
@@ -223,8 +288,8 @@ mod tests {
         ] {
             let args = [OsString::from("rename"), OsString::from(name)];
             assert_eq!(
-                rename_argument(args.into_iter()).unwrap(),
-                Some(name.into())
+                parse_arguments(args.into_iter()).unwrap(),
+                CliCommand::Rename(name.into())
             );
         }
     }
@@ -233,13 +298,67 @@ mod tests {
     fn invalid_arguments_fail_before_opening_the_picker() {
         for args in [
             vec!["unknown"],
+            vec!["status", "extra"],
             vec!["rename"],
             vec!["rename", ""],
             vec!["rename", " \t"],
             vec!["rename", "bad\0name"],
             vec!["rename", "ISSUE-123", "extra"],
         ] {
-            assert!(rename_argument(args.into_iter().map(OsString::from)).is_err());
+            assert!(parse_arguments(args.into_iter().map(OsString::from)).is_err());
+        }
+    }
+
+    #[test]
+    fn status_accepts_an_optional_explicit_session_id() {
+        assert_eq!(
+            parse_arguments([OsString::from("status")].into_iter()).unwrap(),
+            CliCommand::Status(None)
+        );
+        assert_eq!(
+            parse_arguments(["status", "-t", "$12"].map(OsString::from).into_iter()).unwrap(),
+            CliCommand::Status(Some("$12".into()))
+        );
+        for args in [
+            vec!["status", "-t"],
+            vec!["status", "-t", "$"],
+            vec!["status", "-t", "-1"],
+            vec!["status", "-t", "name"],
+            vec!["status", "-t", "$0'; new-session"],
+            vec!["status", "-t", "$0", "extra"],
+        ] {
+            assert!(parse_arguments(args.into_iter().map(OsString::from)).is_err());
+        }
+    }
+
+    #[test]
+    fn status_target_overrides_the_job_or_pane_session() {
+        assert_eq!(status_session("socket,123,-1", Some("$2")).unwrap(), "$2");
+        assert_eq!(status_session("socket,123,0", Some("$2")).unwrap(), "$2");
+        assert_eq!(status_session("socket,123,0", None).unwrap(), "$0");
+        assert!(
+            status_session("socket,123,-1", None)
+                .unwrap_err()
+                .to_string()
+                .contains("status -t")
+        );
+    }
+
+    #[test]
+    fn status_counts_states_in_fixed_order_and_omits_zero_counts() {
+        use AgentState::{Blocked, Idle, Working};
+        for (states, expected) in [
+            (vec![], ""),
+            (vec![Idle], "idle: 1"),
+            (vec![Blocked, Blocked], "blocked: 2"),
+            (vec![Working], "working: 1"),
+            (vec![Idle, Working], "working: 1 | idle: 1"),
+            (
+                vec![Idle, Blocked, Working, Idle, Working],
+                "working: 2 | blocked: 1 | idle: 2",
+            ),
+        ] {
+            assert_eq!(status_line(states.into_iter()), expected);
         }
     }
 
@@ -347,7 +466,12 @@ mod tests {
                 label: "Fix allocation leak".into(),
             },
         ];
-        let windows = group_windows(panes);
+        let windows = group_windows(
+            panes
+                .into_iter()
+                .map(|pane| PaneReading { pane, agent: None })
+                .collect(),
+        );
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].window_index, 1);
         assert!(windows[0].active);

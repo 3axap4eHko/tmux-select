@@ -28,12 +28,18 @@ fn assert_error(output: Output, expected: &str) {
 fn cli_rejects_invalid_arguments_and_missing_context_without_a_terminal() {
     for args in [
         vec!["unknown"],
+        vec!["status", "extra"],
         vec!["rename"],
         vec!["rename", "one", "two"],
     ] {
         assert_error(cli(&args, None, None), "usage:");
     }
     assert_error(cli(&["rename", ""], None, None), "nonempty");
+    assert_error(cli(&["status"], None, None), "TMUX is not set");
+    assert_error(
+        cli(&["status"], Some("/tmp/agents/unused,123,-1"), None),
+        "status-line jobs require status -t",
+    );
     assert_error(
         cli(&["rename", "ISSUE-123"], None, Some("%0")),
         "TMUX is not set",
@@ -167,6 +173,127 @@ impl Drop for Server {
             eprintln!("test directory cleanup: {error}");
         }
     }
+}
+
+#[test]
+#[ignore = "requires tmux; run with cargo test --test rename -- --include-ignored"]
+fn status_counts_agent_panes_only_in_the_current_session_without_switching() {
+    let server = start_server("tmux,socket");
+    let context = server.context();
+    let empty = cli(&["status"], Some(&context), None);
+    assert!(empty.status.success(), "{:?}", empty);
+    assert_eq!(empty.stdout, b"\n");
+
+    let executable = server.directory.join("claude");
+    std::os::unix::fs::symlink("/bin/sleep", &executable).unwrap();
+    let executable = executable.to_str().unwrap();
+    for (name, screen) in [
+        ("working", "* Thinking\u{2026} (1s)"),
+        ("blocked", "Esc to cancel \u{b7} Tab to amend"),
+        ("idle", "Ready"),
+    ] {
+        let pane = server.run(&[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "caller:",
+            "-n",
+            name,
+            executable,
+            "120",
+        ]);
+        server.type_text(&pane, screen);
+        server.wait_for(&pane, screen);
+    }
+    server.run(&["new-session", "-d", "-s", "other", executable, "120"]);
+    let before = server.read("caller:", "#{window_id}:#{pane_id}");
+    let output = cli(&["status"], Some(&context), None);
+    assert!(output.status.success(), "{:?}", output);
+    assert!(output.stderr.is_empty(), "{:?}", output);
+    assert_eq!(output.stdout, b"working: 1 | blocked: 1 | idle: 1\n");
+    assert_eq!(server.read("caller:", "#{window_id}:#{pane_id}"), before);
+    assert_eq!(server.run(&["list-clients"]), "");
+
+    let job_context = format!("{},-1", context.rsplit_once(',').unwrap().0);
+    let job_output = cli(&["status", "-t", "$0"], Some(&job_context), None);
+    assert!(job_output.status.success(), "{:?}", job_output);
+    assert_eq!(job_output.stdout, output.stdout);
+    let other_output = cli(&["status", "-t", "$1"], Some(&context), None);
+    assert!(other_output.status.success(), "{:?}", other_output);
+    assert_eq!(other_output.stdout, b"idle: 1\n");
+    assert_error(
+        cli(&["status", "-t", "$999999"], Some(&job_context), None),
+        "control client",
+    );
+
+    let driver = server.run(&[
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        "caller:",
+        "-n",
+        "picker",
+        env!("CARGO_BIN_EXE_tmux-select"),
+    ]);
+    server.wait_for(&driver, "[claude: working]");
+    server.wait_for(&driver, "[claude: blocked]");
+    server.wait_for(&driver, "[claude: idle]");
+    server.type_text(&driver, "blocked");
+    server.run(&["send-keys", "-t", &driver, "Enter"]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server.read("caller:blocked", "#{window_active}") != "1" {
+        assert!(
+            Instant::now() < deadline,
+            "picker did not select the blocked pane"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    server.run(&["select-window", "-t", before.split_once(':').unwrap().0]);
+
+    let binary = env!("CARGO_BIN_EXE_tmux-select").replace('\'', "'\\''");
+    let status = format!("STATUS[#('{binary}' status -t '#{{session_id}}')]END");
+    server.run(&["set-option", "-g", "status-right", &status]);
+    server.run(&["set-option", "-g", "status-right-length", "100"]);
+    server.run(&["set-option", "-g", "status-interval", "1"]);
+    let viewer = server.run(&[
+        "new-session",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-s",
+        "viewer",
+        "-x",
+        "160",
+        "-y",
+        "40",
+        "env",
+        "-u",
+        "TMUX",
+        "tmux",
+        "-S",
+        server.socket.to_str().unwrap(),
+        "attach-session",
+        "-t",
+        "caller",
+    ]);
+    server.wait_for(&viewer, "STATUS[working: 1 | blocked: 1 | idle: 1]END");
+    assert_eq!(server.read("caller:", "#{window_id}:#{pane_id}"), before);
+    server.run(&["kill-window", "-t", "caller:working"]);
+    server.wait_for(&viewer, "STATUS[blocked: 1 | idle: 1]END");
+    let client = server.run(&["list-clients", "-F", "#{client_name}"]);
+    server.run(&["switch-client", "-c", &client, "-t", "other"]);
+    server.wait_for(&viewer, "STATUS[idle: 1]END");
+    server.run(&["switch-client", "-c", &client, "-t", "caller"]);
+    server.run(&["kill-window", "-t", "caller:blocked"]);
+    server.run(&["kill-window", "-t", "caller:idle"]);
+    server.wait_for(&viewer, "STATUS[]END");
 }
 
 #[test]
