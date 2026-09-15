@@ -1,6 +1,6 @@
 [package]
 name = "tmux-select"
-version = "0.0.9"
+version = "0.0.10"
 edition = "2024"
 authors = ["Ivan Zakharchanka <3axap4eHko@gmail.com>"]
 description = "Agent-aware tmux window picker with a built-in fuzzy finder for Claude Code, Codex, Kimi Code, Pi, OpenCode, Qwen Code, Grok Build, and Muse Code"
