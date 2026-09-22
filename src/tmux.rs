@@ -7,8 +7,6 @@ pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const SENTINEL: &str = "TMUXSELECT_SENTINEL";
 const PANE_FORMAT: &str = "#{pane_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_index}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{?automatic-rename,#{s|\\n| |:pane_current_path},#{s|\\n| |:window_name}}\x1f#{s|\\n| |:window_name}";
-// tmux octal-escapes non-printable bytes in control-mode command output.
-const CONTROL_MODE_PANE_SEPARATOR: &str = r"\037";
 const PANE_FIELDS: usize = 10;
 
 pub struct Pane {
@@ -281,9 +279,13 @@ fn list_panes_command(session_id: &str) -> String {
 }
 
 fn parse_pane(line: &str) -> Result<Pane> {
-    let fields: Vec<&str> = line
-        .splitn(PANE_FIELDS, CONTROL_MODE_PANE_SEPARATOR)
-        .collect();
+    // Older tmux versions octal-escape control-mode command output.
+    let separator = if line.contains('\x1f') {
+        "\x1f"
+    } else {
+        r"\037"
+    };
+    let fields: Vec<&str> = line.splitn(PANE_FIELDS, separator).collect();
     if fields.len() != PANE_FIELDS {
         return Err(format!(
             "list-panes line has {} fields, expected {PANE_FIELDS}: {line:?}",
@@ -398,6 +400,24 @@ mod tests {
             list_panes_command("$0"),
             "list-panes -s -t '$0' -F \"#{pane_id}\u{1f}#{window_id}\u{1f}#{window_index}\u{1f}#{window_active}\u{1f}#{pane_active}\u{1f}#{pane_index}\u{1f}#{pane_pid}\u{1f}#{pane_current_command}\u{1f}#{?automatic-rename,#{s|\\n| |:pane_current_path},#{s|\\n| |:window_name}}\u{1f}#{s|\\n| |:window_name}\""
         );
+    }
+
+    #[test]
+    fn parses_raw_separators_without_splitting_literal_octal_text() {
+        let pane = parse_pane(
+            "%2\x1f@1\x1f1\x1f0\x1f1\x1f1\x1f1095227\x1fbash\x1f/tmp/a\\037b\x1fshell\\037name",
+        )
+        .unwrap();
+        assert_eq!(pane.pane_id, "%2");
+        assert_eq!(pane.window_id, "@1");
+        assert_eq!(pane.window_index, 1);
+        assert!(!pane.window_active);
+        assert!(pane.pane_active);
+        assert_eq!(pane.pane_index, 1);
+        assert_eq!(pane.pane_pid, 1095227);
+        assert_eq!(pane.current_command, "bash");
+        assert_eq!(pane.label, r"/tmp/a\037b");
+        assert_eq!(pane.window_name, r"shell\037name");
     }
 
     #[test]
