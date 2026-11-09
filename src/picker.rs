@@ -126,10 +126,13 @@ fn edit_name<W: Write>(
     initial_name: &str,
     mut rename: impl FnMut(&str) -> Result<Candidate>,
 ) -> Result<Option<Candidate>> {
-    let mut name = initial_name.replace(r"\\", r"\");
+    let mut before_cursor = initial_name.replace(r"\\", r"\");
+    let mut reversed_suffix = String::new();
     let mut error = String::new();
     loop {
-        render_name(screen, &name, &error)?;
+        let mut name = before_cursor.clone();
+        name.extend(reversed_suffix.chars().rev());
+        render_name(screen, &name, before_cursor.chars().count(), &error)?;
         let Some(key) = keys.next() else {
             return Ok(None);
         };
@@ -139,16 +142,53 @@ fn edit_name<W: Write>(
                 Err(failure) => error = failure.to_string(),
             },
             Key::Esc | Key::Ctrl('c') | Key::Ctrl('g') => return Ok(None),
+            Key::Left => {
+                if let Some(ch) = before_cursor.pop() {
+                    reversed_suffix.push(ch);
+                }
+            }
+            Key::Right => {
+                if let Some(ch) = reversed_suffix.pop() {
+                    before_cursor.push(ch);
+                }
+            }
+            Key::CtrlLeft | Key::AltLeft => {
+                for whitespace in [true, false] {
+                    while before_cursor
+                        .chars()
+                        .next_back()
+                        .is_some_and(|ch| ch.is_whitespace() == whitespace)
+                    {
+                        if let Some(ch) = before_cursor.pop() {
+                            reversed_suffix.push(ch);
+                        }
+                    }
+                }
+            }
+            Key::CtrlRight | Key::AltRight => {
+                for whitespace in [true, false] {
+                    while reversed_suffix
+                        .chars()
+                        .next_back()
+                        .is_some_and(|ch| ch.is_whitespace() == whitespace)
+                    {
+                        if let Some(ch) = reversed_suffix.pop() {
+                            before_cursor.push(ch);
+                        }
+                    }
+                }
+            }
             Key::Ctrl('u') => {
-                name.clear();
+                before_cursor.clear();
+                reversed_suffix.clear();
                 error.clear();
             }
             Key::Backspace => {
-                name.pop();
+                before_cursor.pop();
                 error.clear();
             }
             Key::Char(ch) if !ch.is_control() => {
-                name.push(ch);
+                before_cursor.push(ch);
                 error.clear();
             }
             _ => {}
@@ -156,13 +196,16 @@ fn edit_name<W: Write>(
     }
 }
 
-fn render_name<W: Write>(screen: &mut W, name: &str, error: &str) -> Result<()> {
+fn render_name<W: Write>(screen: &mut W, name: &str, position: usize, error: &str) -> Result<()> {
     let (cols, _) = termion::terminal_size().unwrap_or((80, 24));
     let width = usize::from(cols.max(9));
-    let tail: String = name
-        .chars()
-        .skip(name.chars().count().saturating_sub(width - 9))
-        .collect();
+    let length = name.chars().count();
+    let position = position.min(length);
+    let capacity = width - 9;
+    let start = position
+        .saturating_sub(capacity / 2)
+        .min(length.saturating_sub(capacity));
+    let visible: String = name.chars().skip(start).take(capacity).collect();
     let message: String = error
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -170,14 +213,14 @@ fn render_name<W: Write>(screen: &mut W, name: &str, error: &str) -> Result<()> 
         .collect();
     write!(
         screen,
-        "{}{}Rename> {tail}{}Enter: save | Esc: cancel | Ctrl-U: clear{}{}{message}{}{}",
+        "{}{}Rename> {visible}{}Enter: save | Esc: cancel | Ctrl-U: clear{}{}{message}{}{}",
         clear::All,
         cursor::Goto(1, 1),
         cursor::Goto(1, 2),
         cursor::Goto(1, 3),
         color::Fg(color::Red),
         color::Fg(color::Reset),
-        cursor::Goto((tail.chars().count() + 9) as u16, 1)
+        cursor::Goto((position - start + 9) as u16, 1)
     )?;
     screen.flush()?;
     Ok(())
@@ -574,6 +617,136 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn rename_edits_at_the_character_cursor() {
+        for (initial, input, expected) in [
+            (
+                "abcd",
+                vec![
+                    Key::Left,
+                    Key::Left,
+                    Key::Char('X'),
+                    Key::Right,
+                    Key::Backspace,
+                    Key::Char('?'),
+                ],
+                "abX?d",
+            ),
+            (
+                "\u{e9}\u{3bb}z",
+                vec![
+                    Key::Left,
+                    Key::Backspace,
+                    Key::Char('\u{f1}'),
+                    Key::Right,
+                    Key::Char('!'),
+                ],
+                "\u{e9}\u{f1}z!",
+            ),
+            (
+                "",
+                vec![
+                    Key::Left,
+                    Key::Backspace,
+                    Key::CtrlLeft,
+                    Key::AltLeft,
+                    Key::Right,
+                    Key::CtrlRight,
+                    Key::AltRight,
+                    Key::Char('x'),
+                    Key::Left,
+                    Key::Left,
+                    Key::Backspace,
+                    Key::Char('y'),
+                    Key::Right,
+                    Key::Right,
+                    Key::Char('z'),
+                ],
+                "yxz",
+            ),
+            (
+                "abc",
+                vec![
+                    Key::Left,
+                    Key::Ctrl('u'),
+                    Key::Char('x'),
+                    Key::Right,
+                    Key::Char('y'),
+                ],
+                "xy",
+            ),
+        ] {
+            let mut input = input;
+            input.push(Key::Char('\n'));
+            let renamed = edit_name(&mut Vec::new(), &mut keys(&input), initial, |name| {
+                Ok(candidate(name))
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(renamed.name, expected);
+        }
+    }
+
+    #[test]
+    fn rename_moves_by_whitespace_separated_words() {
+        for (left, right) in [
+            (Key::CtrlLeft, Key::CtrlRight),
+            (Key::AltLeft, Key::AltRight),
+        ] {
+            let renamed = edit_name(
+                &mut Vec::new(),
+                &mut keys(&[
+                    left,
+                    left,
+                    Key::Char('['),
+                    right,
+                    Key::Char(']'),
+                    right,
+                    Key::Char('!'),
+                    Key::Char('\n'),
+                ]),
+                "alpha \t beta gamma  ",
+                |name| Ok(candidate(name)),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(renamed.name, "alpha \t [beta] gamma!  ");
+
+            let renamed = edit_name(
+                &mut Vec::new(),
+                &mut keys(&[left, left, right, Key::Char('!'), Key::Char('\n')]),
+                "one-two three",
+                |name| Ok(candidate(name)),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(renamed.name, "one-two! three");
+        }
+    }
+
+    #[test]
+    fn rename_scrolls_a_long_name_to_the_cursor() {
+        let initial = format!("start {}end", "x".repeat(160));
+        let mut screen = Vec::new();
+        let renamed = edit_name(
+            &mut screen,
+            &mut keys(&[
+                Key::CtrlLeft,
+                Key::CtrlLeft,
+                Key::Char('!'),
+                Key::Char('\n'),
+            ]),
+            &initial,
+            |name| Ok(candidate(name)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(renamed.name, format!("!{initial}"));
+        let screen = String::from_utf8(screen).unwrap();
+        assert!(screen.contains("Rename> !start "));
+        assert!(screen.ends_with("\x1b[1;10H"));
     }
 
     fn candidate(display: &str) -> Candidate {

@@ -130,7 +130,9 @@ automatic renaming globally makes all windows inheriting that setting show names
 The label is read in the existing batched pane query, with no saved picker state.
 
 Press `Ctrl-R` to rename the highlighted window. Its current window name is
-prefilled; type or use Backspace to edit, or `Ctrl-U` to clear it. Enter saves and
+prefilled. Left/Right moves by character; Ctrl+Left/Right or Alt+Left/Right moves
+by word, with whitespace separating words. Type to insert at the cursor, use
+Backspace to delete before it, or `Ctrl-U` to clear the name. Enter saves and
 returns to the picker with the updated name and existing agent annotations.
 Esc, `Ctrl-C`, or `Ctrl-G` cancels the edit. Errors stay in the rename prompt.
 The filter is preserved, so a renamed window disappears if it no longer matches.

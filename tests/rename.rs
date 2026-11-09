@@ -474,6 +474,74 @@ fn ctrl_r_renames_the_selected_window_and_updates_the_open_picker() {
 
 #[test]
 #[ignore = "requires tmux; run with cargo test --test rename -- --include-ignored"]
+fn ctrl_r_moves_by_character_and_word_with_the_cursor_visible() {
+    let server = start_server("tmux.socket");
+    let target = server.read("caller:", "#{pane_id}");
+    let context = server.context();
+    let long_name = format!("start {}end", "x".repeat(160));
+    for (initial, navigation, expected) in [
+        ("alpha beta", vec!["Left"], "alpha bet!a".to_owned()),
+        (
+            "alpha beta",
+            vec!["Left", "Left", "Right"],
+            "alpha bet!a".to_owned(),
+        ),
+        ("alpha beta", vec!["C-Left"], "alpha !beta".to_owned()),
+        ("alpha beta", vec!["M-Left"], "alpha !beta".to_owned()),
+        (
+            "alpha beta",
+            vec!["C-Left", "C-Left", "C-Right"],
+            "alpha! beta".to_owned(),
+        ),
+        (
+            "alpha beta",
+            vec!["M-Left", "M-Left", "M-Right"],
+            "alpha! beta".to_owned(),
+        ),
+        (
+            long_name.as_str(),
+            vec!["C-Left", "C-Left"],
+            format!("!{long_name}"),
+        ),
+    ] {
+        let output = cli(&["rename", initial], Some(&context), Some(&target));
+        assert!(output.status.success(), "{:?}", output);
+        let driver = server.run(&[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            "caller:",
+            env!("CARGO_BIN_EXE_tmux-select"),
+        ]);
+        server.wait_for(&driver, "Ctrl-R: rename");
+        server.run(&["send-keys", "-t", &driver, "C-r"]);
+        server.wait_for(&driver, "Rename>");
+        let mut input = vec!["send-keys", "-t", driver.as_str()];
+        input.extend_from_slice(&navigation);
+        server.run(&input);
+        server.type_text(&driver, "!");
+        let prompt = if initial == long_name {
+            "Rename> !start ".to_owned()
+        } else {
+            format!("Rename> {expected}")
+        };
+        server.wait_for(&driver, &prompt);
+        assert_eq!(
+            server.read(&driver, "#{cursor_x}:#{cursor_y}"),
+            format!("{}:0", expected.find('!').unwrap() + 9)
+        );
+        server.run(&["send-keys", "-t", &driver, "Enter"]);
+        server.wait_for(&driver, "Ctrl-R: rename");
+        assert_eq!(server.read(&target, "#{window_name}"), expected);
+        server.run(&["send-keys", "-t", &driver, "C-g"]);
+    }
+}
+
+#[test]
+#[ignore = "requires tmux; run with cargo test --test rename -- --include-ignored"]
 fn ctrl_r_preserves_backslashes_across_saves_and_edits() {
     let server = start_server("tmux.socket");
     let target = server.read("caller:", "#{pane_id}");
