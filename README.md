@@ -72,10 +72,12 @@ This replaces the right-hand status text. To keep existing content, insert
 The executable must be available on the tmux server's PATH.
 
 `tmux-select status` prints one line of agent-pane counts for the current session,
-ordered as `working: 2 | blocked: 1 | idle: 3`. Zero counts are omitted; no detected
-agents produces an empty line. Each invocation captures fresh states and exits
-without opening the picker or changing focus. tmux refreshes the command output
-at its status interval. Idle means no recognized working or blocked indicator,
+ordered as `working: 2 | blocked: 1 | idle: 3`. The output includes tmux styles
+matching the picker: working is green, blocked is red, and idle is yellow.
+Separators and following text retain the surrounding foreground and background.
+Zero counts are omitted; no detected agents produces an empty line. Each invocation
+captures fresh states and exits without opening the picker or changing focus.
+tmux refreshes the command output at its status interval. Idle means no recognized working or blocked indicator,
 not necessarily a completed task. Failures produce stderr diagnostics and a
 nonzero exit code.
 

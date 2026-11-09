@@ -151,13 +151,30 @@ fn status_line(states: impl Iterator<Item = AgentState>) -> String {
         }
     }
     let mut line = String::new();
-    for (label, count) in [("working", working), ("blocked", blocked), ("idle", idle)] {
+    for (state, count) in [
+        (AgentState::Working, working),
+        (AgentState::Blocked, blocked),
+        (AgentState::Idle, idle),
+    ] {
         if count != 0 {
-            if !line.is_empty() {
+            if line.is_empty() {
+                line.push_str("#[push-default]");
+            } else {
                 line.push_str(" | ");
             }
-            line.push_str(&format!("{label}: {count}"));
+            let color = match state_color(state) {
+                picker::SpanColor::Red => "red",
+                picker::SpanColor::Green => "green",
+                picker::SpanColor::Yellow => "yellow",
+            };
+            line.push_str(&format!(
+                "#[fg={color}]{}: {count}#[default]",
+                state.label()
+            ));
         }
+    }
+    if !line.is_empty() {
+        line.push_str("#[pop-default]");
     }
     line
 }
@@ -349,13 +366,25 @@ mod tests {
         use AgentState::{Blocked, Idle, Working};
         for (states, expected) in [
             (vec![], ""),
-            (vec![Idle], "idle: 1"),
-            (vec![Blocked, Blocked], "blocked: 2"),
-            (vec![Working], "working: 1"),
-            (vec![Idle, Working], "working: 1 | idle: 1"),
+            (
+                vec![Idle],
+                "#[push-default]#[fg=yellow]idle: 1#[default]#[pop-default]",
+            ),
+            (
+                vec![Blocked, Blocked],
+                "#[push-default]#[fg=red]blocked: 2#[default]#[pop-default]",
+            ),
+            (
+                vec![Working],
+                "#[push-default]#[fg=green]working: 1#[default]#[pop-default]",
+            ),
+            (
+                vec![Idle, Working],
+                "#[push-default]#[fg=green]working: 1#[default] | #[fg=yellow]idle: 1#[default]#[pop-default]",
+            ),
             (
                 vec![Idle, Blocked, Working, Idle, Working],
-                "working: 2 | blocked: 1 | idle: 2",
+                "#[push-default]#[fg=green]working: 2#[default] | #[fg=red]blocked: 1#[default] | #[fg=yellow]idle: 2#[default]#[pop-default]",
             ),
         ] {
             assert_eq!(status_line(states.into_iter()), expected);

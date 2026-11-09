@@ -213,7 +213,10 @@ fn status_counts_agent_panes_only_in_the_current_session_without_switching() {
     let output = cli(&["status"], Some(&context), None);
     assert!(output.status.success(), "{:?}", output);
     assert!(output.stderr.is_empty(), "{:?}", output);
-    assert_eq!(output.stdout, b"working: 1 | blocked: 1 | idle: 1\n");
+    assert_eq!(
+        output.stdout,
+        b"#[push-default]#[fg=green]working: 1#[default] | #[fg=red]blocked: 1#[default] | #[fg=yellow]idle: 1#[default]#[pop-default]\n"
+    );
     assert_eq!(server.read("caller:", "#{window_id}:#{pane_id}"), before);
     assert_eq!(server.run(&["list-clients"]), "");
 
@@ -223,7 +226,10 @@ fn status_counts_agent_panes_only_in_the_current_session_without_switching() {
     assert_eq!(job_output.stdout, output.stdout);
     let other_output = cli(&["status", "-t", "$1"], Some(&context), None);
     assert!(other_output.status.success(), "{:?}", other_output);
-    assert_eq!(other_output.stdout, b"idle: 1\n");
+    assert_eq!(
+        other_output.stdout,
+        b"#[push-default]#[fg=yellow]idle: 1#[default]#[pop-default]\n"
+    );
     assert_error(
         cli(&["status", "-t", "$999999"], Some(&job_context), None),
         "control client",
@@ -257,7 +263,8 @@ fn status_counts_agent_panes_only_in_the_current_session_without_switching() {
     server.run(&["select-window", "-t", before.split_once(':').unwrap().0]);
 
     let binary = env!("CARGO_BIN_EXE_tmux-select").replace('\'', "'\\''");
-    let status = format!("STATUS[#('{binary}' status -t '#{{session_id}}')]END");
+    let status =
+        format!("#[fg=colour201,bg=colour18]STATUS[#('{binary}' status -t '#{{session_id}}')]END");
     server.run(&["set-option", "-g", "status-right", &status]);
     server.run(&["set-option", "-g", "status-right-length", "100"]);
     server.run(&["set-option", "-g", "status-interval", "1"]);
@@ -284,6 +291,18 @@ fn status_counts_agent_panes_only_in_the_current_session_without_switching() {
         "caller",
     ]);
     server.wait_for(&viewer, "STATUS[working: 1 | blocked: 1 | idle: 1]END");
+    let rendered = server.run(&["capture-pane", "-e", "-p", "-t", &viewer]);
+    let counts = rendered
+        .split_once("STATUS[")
+        .unwrap()
+        .1
+        .split_once("]END")
+        .unwrap()
+        .0;
+    assert_eq!(
+        counts,
+        "\x1b[32mworking: 1\x1b[38;5;201m | \x1b[31mblocked: 1\x1b[38;5;201m | \x1b[33midle: 1\x1b[38;5;201m"
+    );
     assert_eq!(server.read("caller:", "#{window_id}:#{pane_id}"), before);
     server.run(&["kill-window", "-t", "caller:working"]);
     server.wait_for(&viewer, "STATUS[blocked: 1 | idle: 1]END");
