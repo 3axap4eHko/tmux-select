@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+const REGISTRATION: &str = "@tmux-select-session";
+
 fn cli(args: &[&str], tmux: Option<&str>, pane: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tmux-select"));
     command
@@ -576,4 +578,184 @@ fn ctrl_r_preserves_backslashes_across_saves_and_edits() {
         format!("{stored} edited")
     );
     server.run(&["send-keys", "-t", &driver, "Escape"]);
+}
+
+#[test]
+fn registration_requires_the_calling_pane_context() {
+    let session = "019aabbc-1234-7000-8000-123456789abc";
+    assert_error(
+        cli(&["register", "codex", session], None, None),
+        "TMUX is not set",
+    );
+    assert_error(
+        cli(
+            &["register", "codex", session],
+            Some("/tmp/agents/unused,123,0"),
+            None,
+        ),
+        "TMUX_PANE is not set",
+    );
+    assert_error(
+        cli(&["resume"], Some("/tmp/agents/unused,123,0"), None),
+        "TMUX_PANE is not set",
+    );
+}
+
+#[test]
+#[ignore = "requires tmux and rustc; run with cargo test --test rename -- --include-ignored"]
+fn registration_and_resume_use_the_exact_conversation_in_the_calling_pane() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let server = start_server("tmux,socket");
+    let context = server.context();
+    let pane = server.run(&[
+        "split-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        "caller:0",
+        "sh",
+    ]);
+    let focus = server.run(&["display-message", "-p", "#{window_id}:#{pane_id}"]);
+    let window_name = server.read(&pane, "#{window_name}");
+    let session = "019aabbc-1234-7000-8000-123456789abc";
+
+    let fixture_source = server.directory.join("agent.rs");
+    std::fs::write(
+        &fixture_source,
+        r#"
+fn main() {
+    if std::env::var_os("TMUX_SELECT_FIXTURE_FAIL").is_some() {
+        eprintln!("saved conversation unavailable");
+        std::process::exit(17);
+    }
+    for argument in std::env::args().skip(1) {
+        println!("{argument}");
+    }
+    println!("{}", std::env::current_dir().unwrap().display());
+    println!("{}", std::env::var("TMUX_PANE").unwrap());
+}
+"#,
+    )
+    .unwrap();
+    let fixture_binary = server.directory.join("agent");
+    let compiled = Command::new("rustc")
+        .args(["--edition=2024", "--crate-name", "agent_fixture"])
+        .arg(&fixture_source)
+        .arg("-o")
+        .arg(&fixture_binary)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for agent in ["codex", "claude"] {
+        std::os::unix::fs::symlink(&fixture_binary, server.directory.join(agent)).unwrap();
+    }
+    let path = std::env::join_paths(std::iter::once(server.directory.clone()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let resume = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tmux-select"));
+        command
+            .arg("resume")
+            .env("TMUX", &context)
+            .env("TMUX_PANE", &pane)
+            .env("PATH", &path)
+            .current_dir(&server.directory);
+        command
+    };
+
+    assert_error(
+        cli(&["resume"], Some(&context), Some(&pane)),
+        "pane has no tmux-select registration",
+    );
+    for (agent, option) in [("codex", "resume"), ("claude", "--resume")] {
+        let title = server.read(&pane, "#{pane_title}");
+        let output = if agent == "codex" {
+            cli(&["register", agent, session], Some(&context), Some(&pane))
+        } else {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_tmux-select"))
+                .args(["register", agent])
+                .env("TMUX", &context)
+                .env("TMUX_PANE", &pane)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            write!(input, "{{\"session_id\":\"{session}\",\"hook_event_name\":\"SessionStart\",\"nested\":{{\"session_id\":\"wrong\"}}}}").unwrap();
+            drop(input);
+            child.wait_with_output().unwrap()
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            server.run(&["show-options", "-p", "-v", "-t", &pane, REGISTRATION]),
+            format!("{agent}:{session}")
+        );
+        assert_eq!(server.read(&pane, "#{pane_title}"), title);
+        assert_eq!(server.read(&pane, "#{window_name}"), window_name);
+        server.run(&["select-pane", "-t", &pane, "-T", &format!("{agent} title")]);
+        assert_eq!(
+            server.run(&["display-message", "-p", "#{window_id}:#{pane_id}"]),
+            focus
+        );
+        let output = resume().output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "{option}\n{session}\n{}\n{pane}\n",
+                server.directory.display()
+            )
+        );
+    }
+    let failed = resume()
+        .env("TMUX_SELECT_FIXTURE_FAIL", "1")
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(17));
+    assert_error(failed, "saved conversation unavailable");
+    server.run(&[
+        "set-option",
+        "-g",
+        REGISTRATION,
+        &format!("codex:{session}"),
+    ]);
+    server.run(&["set-option", "-p", "-u", "-t", &pane, REGISTRATION]);
+    assert_error(
+        resume().output().unwrap(),
+        "pane has no tmux-select registration",
+    );
+    server.run(&["set-option", "-g", "-u", REGISTRATION]);
+    server.run(&[
+        "set-option",
+        "-p",
+        "-t",
+        &pane,
+        REGISTRATION,
+        &format!("pi:{session}"),
+    ]);
+    assert_error(resume().output().unwrap(), "supports only claude and codex");
+    server.run(&["kill-pane", "-t", &pane]);
+    assert_error(
+        cli(&["register", "codex", session], Some(&context), Some(&pane)),
+        "tmux pane command failed",
+    );
 }

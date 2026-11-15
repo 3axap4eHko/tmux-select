@@ -158,6 +158,57 @@ environment variables. Pass the name as one quoted argument. A missing or invali
 context, an empty or whitespace-only name, or a failed tmux command produces an
 error and a nonzero exit status.
 
+### Register and resume an agent conversation
+
+Register the calling pane's current Claude or Codex conversation:
+
+```sh
+tmux-select register codex <session-id>
+tmux-select register claude <session-id>
+```
+
+With only the agent argument, registration reads the hook event JSON from stdin
+and extracts its top-level string field named `session_id`. Configure the agent's
+`SessionStart` command hook as `tmux-select register codex` or
+`tmux-select register claude`. For example, the Codex entry in
+`~/.codex/hooks.json` is:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "tmux-select register codex" }] }
+    ]
+  }
+}
+```
+
+The same hook shape in `~/.claude/settings.json` uses
+`tmux-select register claude`. Merge these entries into existing hook settings.
+Register again whenever the current conversation changes. The explicit session-ID
+form uses its argument; it does not consume hook input. Registration requires a
+complete conversation UUID. Registration requires inherited `TMUX` and
+`TMUX_PANE`, including in the hook form, which fails outside tmux. It stores
+`<agent>:<session-id>` in that pane's `@tmux-select-session` pane option and
+keeps no other state. It does not switch focus, rename the window or change the
+pane title, and programs changing the title through terminal escape sequences do
+not affect the registration. Inspect it with
+`tmux show-options -p @tmux-select-session`.
+
+Run `tmux-select resume` in the registered pane to replace tmux-select with
+`codex resume <session-id>` or `claude --resume <session-id>`, inheriting the
+terminal, working directory and environment. The agent performs the
+saved-conversation lookup, and its diagnostics and exit status are returned
+unchanged. There is no fallback to the latest conversation or a conversation
+picker. Only a value set on the pane itself counts; window, session or global
+values of the option are ignored. Missing pane context, missing or invalid
+registration, unsupported agents, a failed agent launch and invalid hook JSON
+return errors.
+
+The registration lasts as long as the pane, including `respawn-pane`, and ends
+when the pane or the tmux server exits. Hook settings and installed agent
+configurations are not changed by tmux-select.
+
 ### Keys
 
 | Key | Action |
@@ -204,6 +255,10 @@ They cover caller-window targeting, Ctrl-R editing and errors, and literal names
 including repeated edits of names containing backslashes. The status test covers
 empty output, counts for all three states, explicit targets, session isolation,
 focus preservation, and status-line rendering and refresh through actual `#()` jobs.
+Registration checks use compiled stand-in agents to verify the pane option,
+unchanged pane titles, title changes after registration, ignored global values,
+hook input, exact resume arguments, inherited context, agent exit status and
+failure handling.
 
 ## License
 

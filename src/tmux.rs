@@ -8,6 +8,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const SENTINEL: &str = "TMUXSELECT_SENTINEL";
 const PANE_FORMAT: &str = "#{pane_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_index}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{?automatic-rename,#{s|\\n| |:pane_current_path},#{s|\\n| |:window_name}}\x1f#{s|\\n| |:window_name}";
 const PANE_FIELDS: usize = 10;
+const REGISTRATION_OPTION: &str = "@tmux-select-session";
 
 pub struct Pane {
     pub pane_id: String,
@@ -43,8 +44,62 @@ pub fn session_id_from_tmux_value(tmux: &str) -> Result<String> {
 }
 
 pub fn rename_window(tmux: &str, pane_id: &str, name: &str) -> Result<()> {
-    let socket = rename_socket(tmux, pane_id)?;
+    let socket = pane_socket(tmux, pane_id)?;
     run_rename(&mut rename_command(socket, pane_id, name)).map(|_| ())
+}
+
+pub fn set_pane_registration(tmux: &str, pane_id: &str, value: &str) -> Result<()> {
+    run_pane_command(
+        tmux,
+        pane_id,
+        &[
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            REGISTRATION_OPTION,
+            value,
+        ],
+    )?;
+    Ok(())
+}
+
+// A #{@option} format falls back to window, session and global values, so only
+// show-options -p reads the value registered on this pane.
+pub fn pane_registration(tmux: &str, pane_id: &str) -> Result<Option<String>> {
+    let value = run_pane_command(
+        tmux,
+        pane_id,
+        &[
+            "show-options",
+            "-p",
+            "-q",
+            "-v",
+            "-t",
+            pane_id,
+            REGISTRATION_OPTION,
+        ],
+    )?;
+    Ok(Some(value).filter(|value| !value.is_empty()))
+}
+
+fn run_pane_command(tmux: &str, pane_id: &str, args: &[&str]) -> Result<String> {
+    let socket = pane_socket(tmux, pane_id)?;
+    let output = Command::new("tmux")
+        .args(["-S", socket])
+        .args(args)
+        .output()
+        .map_err(|error| format!("failed to start tmux: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux pane command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?
+        .trim_end_matches('\n')
+        .to_owned())
 }
 
 pub fn rename_selected_window(tmux: &str, window_id: &str, name: &str) -> Result<String> {
@@ -87,7 +142,7 @@ fn run_rename(command: &mut Command) -> Result<String> {
     Ok(name.trim_end_matches('\n').to_owned())
 }
 
-fn rename_socket<'a>(tmux: &'a str, pane_id: &str) -> Result<&'a str> {
+fn pane_socket<'a>(tmux: &'a str, pane_id: &str) -> Result<&'a str> {
     if !pane_id.strip_prefix('%').is_some_and(is_decimal) {
         return Err("TMUX_PANE must be a pane ID such as %0".into());
     }
@@ -328,7 +383,7 @@ mod tests {
     #[test]
     fn rename_context_uses_the_calling_server_even_with_commas_in_its_path() {
         assert_eq!(
-            rename_socket("/tmp/agents/a,b/socket,123,4", "%12").unwrap(),
+            pane_socket("/tmp/agents/a,b/socket,123,4", "%12").unwrap(),
             "/tmp/agents/a,b/socket"
         );
     }
@@ -348,7 +403,7 @@ mod tests {
     #[test]
     fn rename_context_rejects_ambiguous_targets_and_malformed_servers() {
         for pane in ["", "%", "0", "@0", "name", "%1;", "%1:0", "% 1"] {
-            assert!(rename_socket("/tmp/agents/socket,123,0", pane).is_err());
+            assert!(pane_socket("/tmp/agents/socket,123,0", pane).is_err());
         }
         for tmux in [
             "",
@@ -359,7 +414,7 @@ mod tests {
             "socket,abc,0",
             "socket,123,x",
         ] {
-            assert!(rename_socket(tmux, "%0").is_err());
+            assert!(pane_socket(tmux, "%0").is_err());
         }
     }
 

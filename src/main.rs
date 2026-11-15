@@ -2,6 +2,7 @@ mod agent;
 mod collect;
 mod picker;
 mod process;
+mod registration;
 mod tmux;
 
 use std::collections::HashMap;
@@ -10,8 +11,9 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
-use agent::AgentState;
+use agent::{AgentKind, AgentState};
 use collect::{PaneReading, collect_panes};
+use registration::Registration;
 use tmux::Result;
 
 fn main() -> ExitCode {
@@ -44,6 +46,22 @@ fn run() -> Result<()> {
             let session = tmux::session_id_from_tmux_value(&tmux)?;
             let panes = collect_panes(Path::new(tmux::socket_from_tmux_value(&tmux)?), &session)?;
             show_picker(&tmux, panes)
+        }
+        CliCommand::Register(agent, session_id) => {
+            let pane_id = std::env::var("TMUX_PANE")
+                .map_err(|_| "TMUX_PANE is not set; cannot identify the calling pane")?;
+            let registration = match session_id {
+                Some(session_id) => Registration::new(agent, session_id)?,
+                None => Registration::from_hook(agent, std::io::stdin().lock())?,
+            };
+            tmux::set_pane_registration(&tmux, &pane_id, &registration.value())
+        }
+        CliCommand::Resume => {
+            let pane_id = std::env::var("TMUX_PANE")
+                .map_err(|_| "TMUX_PANE is not set; cannot identify the calling pane")?;
+            let value = tmux::pane_registration(&tmux, &pane_id)?
+                .ok_or("pane has no tmux-select registration")?;
+            match Registration::from_value(&value)?.resume()? {}
         }
         CliCommand::Rename(name) => {
             let pane_id = std::env::var("TMUX_PANE")
@@ -84,6 +102,8 @@ fn show_picker(tmux: &str, panes: Vec<PaneReading>) -> Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 enum CliCommand {
     Pick,
+    Register(AgentKind, Option<String>),
+    Resume,
     Rename(String),
     Status(Option<String>),
 }
@@ -92,6 +112,34 @@ fn parse_arguments(mut args: impl Iterator<Item = OsString>) -> Result<CliComman
     let Some(command) = args.next() else {
         return Ok(CliCommand::Pick);
     };
+    if command == "register" {
+        let agent = args
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .ok_or("usage: tmux-select register <agent> [<session-id>]")?;
+        let agent = registration::agent_kind(&agent)?;
+        let session_id = args
+            .next()
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| "session ID must be valid UTF-8")
+            })
+            .transpose()?;
+        if args.next().is_some() {
+            return Err("usage: tmux-select register <agent> [<session-id>]".into());
+        }
+        if let Some(session_id) = &session_id {
+            Registration::new(agent, session_id.clone())?;
+        }
+        return Ok(CliCommand::Register(agent, session_id));
+    }
+    if command == "resume" {
+        if args.next().is_some() {
+            return Err("usage: tmux-select resume".into());
+        }
+        return Ok(CliCommand::Resume);
+    }
     if command == "status" {
         let Some(option) = args.next() else {
             return Ok(CliCommand::Status(None));
@@ -114,7 +162,7 @@ fn parse_arguments(mut args: impl Iterator<Item = OsString>) -> Result<CliComman
         return Ok(CliCommand::Status(Some(session)));
     }
     if command != "rename" {
-        return Err("usage: tmux-select [status | rename <name>]".into());
+        return Err("usage: tmux-select [status | rename <name> | register <agent> [<session-id>] | resume]".into());
     }
     let name = args
         .next()
@@ -292,6 +340,38 @@ mod tests {
             parse_arguments(std::iter::empty()).unwrap(),
             CliCommand::Pick
         );
+    }
+
+    #[test]
+    fn registration_arguments_select_hook_or_explicit_session_input() {
+        let session = "019aabbc-1234-7000-8000-123456789abc";
+        assert_eq!(
+            parse_arguments(["register", "codex"].map(OsString::from).into_iter()).unwrap(),
+            CliCommand::Register(AgentKind::Codex, None)
+        );
+        assert_eq!(
+            parse_arguments(
+                ["register", "claude", session]
+                    .map(OsString::from)
+                    .into_iter()
+            )
+            .unwrap(),
+            CliCommand::Register(AgentKind::Claude, Some(session.into()))
+        );
+        assert_eq!(
+            parse_arguments(["resume"].map(OsString::from).into_iter()).unwrap(),
+            CliCommand::Resume
+        );
+        for args in [
+            vec!["register"],
+            vec!["register", "pi"],
+            vec!["register", "codex", ""],
+            vec!["register", "codex", "--last"],
+            vec!["register", "codex", session, "extra"],
+            vec!["resume", "extra"],
+        ] {
+            assert!(parse_arguments(args.into_iter().map(OsString::from)).is_err());
+        }
     }
 
     #[test]
