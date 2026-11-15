@@ -168,10 +168,28 @@ tmux-select register claude <session-id>
 ```
 
 With only the agent argument, registration reads the hook event JSON from stdin
-and extracts its top-level string field named `session_id`. Configure the agent's
-`SessionStart` command hook as `tmux-select register codex` or
-`tmux-select register claude`. For example, the Codex entry in
-`~/.codex/hooks.json` is:
+and extracts its top-level string field named `session_id`. The agent's
+`SessionStart` command hook runs `tmux-select register claude` or
+`tmux-select register codex`; install it as a plugin or configure it manually.
+
+This repository is a plugin marketplace for both agents. Each plugin contains only
+that hook, so install the `tmux-select` binary separately and keep it on the
+`PATH` the agent passes to hooks:
+
+```sh
+claude plugin marketplace add 3axap4eHko/tmux-select
+claude plugin install tmux-select@tmux-select
+
+codex plugin marketplace add 3axap4eHko/tmux-select@v<version>
+codex plugin add tmux-select@tmux-select
+```
+
+Pinning the Codex marketplace to a release tag keeps the hook unchanged until you
+choose a newer tag. If Codex lists the hook as needing review, trust it with
+`/hooks`. Remove the plugins with `claude plugin uninstall tmux-select@tmux-select`
+and `codex plugin remove tmux-select@tmux-select`.
+
+To configure the hook manually instead, the Codex entry in `~/.codex/hooks.json` is:
 
 ```json
 {

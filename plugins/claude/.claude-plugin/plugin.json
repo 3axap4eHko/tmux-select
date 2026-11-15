@@ -1,0 +1,11 @@
+{
+  "name": "tmux-select",
+  "version": "0.0.11",
+  "description": "Register each Claude Code conversation with its tmux pane for tmux-select resume",
+  "author": {
+    "name": "Ivan Zakharchanka"
+  },
+  "homepage": "https://github.com/3axap4eHko/tmux-select",
+  "repository": "https://github.com/3axap4eHko/tmux-select",
+  "license": "Apache-2.0"
+}

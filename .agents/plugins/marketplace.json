@@ -1,0 +1,12 @@
+{
+  "name": "tmux-select",
+  "plugins": [
+    {
+      "name": "tmux-select",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex"
+      }
+    }
+  ]
+}
